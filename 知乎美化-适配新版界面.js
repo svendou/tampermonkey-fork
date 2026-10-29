@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.10
+// @version      0.1.1
 // @author       sven
 // @description  新版首页宽屏、圆角卡片、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
@@ -23,7 +23,7 @@
 (function() {
     'use strict';
     var menu_ALL = [
-        ['menu_widescreenDisplay', '宽屏显示', '勾选 = 该页面开启宽屏显示（刷新后查看效果）', ''],
+        ['menu_widescreenDisplay', '宽屏显示', '选择需要宽屏显示的页面，修改后立即生效并自动保存。', ''],
         ['menu_widescreenDisplayIndex', '首页', '宽屏显示', true],
         ['menu_widescreenDisplayQuestion', '问题页', '宽屏显示', true],
         ['menu_widescreenDisplaySearch', '搜索页、话题页', '宽屏显示', true],
@@ -47,6 +47,7 @@
     addStyle();
     window.addEventListener('urlchange', scheduleUpdate);
     window.addEventListener('popstate', scheduleUpdate);
+    document.addEventListener('selectionchange', scheduleUpdate);
     // 新版首页异步挂载，监听结构变化，并合并同一批更新。
     let updateTimer = 0;
     const layoutObserver = new MutationObserver(scheduleUpdate);
@@ -118,51 +119,60 @@
 
     // 脚本设置
     function menu_setting(type, title, tips, line, menu) {
-        let _br = '', _html = `<style class="zhihuE_SettingStyle">.zhihuE_SettingRoot {position: absolute;top: 50%;left: 50%;-webkit-transform: translate(-50%, -50%);-moz-transform: translate(-50%, -50%);-ms-transform: translate(-50%, -50%);-o-transform: translate(-50%, -50%);transform: translate(-50%, -50%);width: auto;min-width: 400px;max-width: 600px;height: auto;min-height: 150px;max-height: 400px;color: #535353;background-color: #fff;border-radius: 3px;}
-.zhihuE_SettingBackdrop_1 {position: fixed;top: 0;right: 0;bottom: 0;left: 0;z-index: 203;display: -webkit-box;display: -ms-flexbox;display: flex;-webkit-box-orient: vertical;-webkit-box-direction: normal;-ms-flex-direction: column;flex-direction: column;-webkit-box-pack: center;-ms-flex-pack: center;justify-content: center;overflow-x: hidden;overflow-y: auto;-webkit-transition: opacity .3s ease-out;transition: opacity .3s ease-out;}
-.zhihuE_SettingBackdrop_2 {position: absolute;top: 0;right: 0;bottom: 0;left: 0;z-index: 0;background-color: rgba(18,18,18,.65);-webkit-transition: background-color .3s ease-out;transition: background-color .3s ease-out;}
-.zhihuE_SettingRoot .zhihuE_SettingHeader {padding: 10px 20px;color: #fff;font-weight: bold;background-color: #3994ff;border-radius: 3px 3px 0 0;}
-.zhihuE_SettingRoot .zhihuE_SettingMain {padding: 10px 20px;border-radius: 0 0 3px 3px;}
-.zhihuE_SettingHeader span {float: right;cursor: pointer;}
-.zhihuE_SettingMain input {margin: 10px 6px 10px 0;vertical-align:middle;}
-.zhihuE_SettingMain input[type=text] {margin: 5px 6px 5px 0;padding-block: 0;}
-.zhihuE_SettingMain input[name=zhihuE_Setting_Checkbox] {cursor: pointer;}
-.zhihuE_SettingMain label {margin-right: 20px;user-select: none;cursor: pointer;vertical-align:middle;}
-.zhihuE_SettingMain hr {border: 0.5px solid #f4f4f4;}
-[data-theme="dark"] .zhihuE_SettingRoot {color: #adbac7;background-color: #343A44;}
-[data-theme="dark"] .zhihuE_SettingHeader {color: #d0d0d0;background-color: #2D333B;}
-[data-theme="dark"] .zhihuE_SettingMain hr {border: 0.5px solid #2d333b;}</style>
-        <div class="zhihuE_SettingBackdrop_1"><div class="zhihuE_SettingBackdrop_2"></div><div class="zhihuE_SettingRoot">
-            <div class="zhihuE_SettingHeader">${title}<span class="zhihuE_SettingClose" title="点击关闭"><svg class="Zi Zi--Close Modal-closeIcon" fill="currentColor" viewBox="0 0 24 24" width="24" height="24"><path d="M13.486 12l5.208-5.207a1.048 1.048 0 0 0-.006-1.483 1.046 1.046 0 0 0-1.482-.005L12 10.514 6.793 5.305a1.048 1.048 0 0 0-1.483.005 1.046 1.046 0 0 0-.005 1.483L10.514 12l-5.208 5.207a1.048 1.048 0 0 0 .006 1.483 1.046 1.046 0 0 0 1.482.005L12 13.486l5.207 5.208a1.048 1.048 0 0 0 1.483-.006 1.046 1.046 0 0 0 .005-1.482L13.486 12z" fill-rule="evenodd"></path></svg></span></div>
-            <div class="zhihuE_SettingMain"><p>${tips}</p><hr>`
-        if (line) _br = '<br>'
-        for (let i=0; i<menu.length; i++) {
-            if (menu[i][0] === 'menu_widescreenDisplayWidth') {
-                _html += `<label>${menu[i][2]}：<input name="${menu[i][0]}" type="text" oninput="value=value.replace(/[^\\d]/g,'')" value="${GM_getValue(menu[i][0])}" style="width: 50px;"></label>${_br}`
-            } else if (GM_getValue(menu[i][0])) {
-                _html += `<label><input name="zhihuE_Setting_Checkbox" type="checkbox" value="${menu[i][0]}" checked="checked">${menu[i][1]}</label>${_br}`
-            } else {
-                _html += `<label><input name="zhihuE_Setting_Checkbox" type="checkbox" value="${menu[i][0]}">${menu[i][1]}</label>${_br}`
-            }
-        }
-        _html += `</div></div></div>`
-        document.body.insertAdjacentHTML('beforeend', _html); // 插入网页末尾
-        setTimeout(function() { // 延迟 100 毫秒，避免太快
-            const doc = document.querySelector('.zhihuE_SettingBackdrop_1');
-            if (!doc) return
-            // 关闭按钮 点击事件
-            doc.querySelector('.zhihuE_SettingClose').onclick = function(){this.parentElement.parentElement.parentElement.remove();document.querySelector('.zhihuE_SettingStyle').remove();}
-            // 点击周围空白处 = 点击关闭按钮
-            doc.querySelector('.zhihuE_SettingBackdrop_2').onclick = function(event){if (event.target == this) {document.querySelector('.zhihuE_SettingClose').click();};}
-            // 复选框 点击事件
-            doc.querySelectorAll('input[name=zhihuE_Setting_Checkbox]').forEach(function (checkBox) {
-                checkBox.addEventListener('click', function(){GM_setValue(this.value, this.checked);registerMenuCommand();addStyle();});
-            })
-            // 输入框 变化事件
-            doc.querySelectorAll('input[type=text]').forEach(function (checkBox) {
-                checkBox.onchange = function(){const width = Math.min(2400, Math.max(640, Number(this.value) || 1440));this.value = width;GM_setValue(this.name, String(width));registerMenuCommand();addStyle();};
-            })
-        }, 100)
+        const existing = document.querySelector('dialog.zhihuE_SettingRoot');
+        if (existing) { existing.querySelector('.zhihuE_SettingClose').focus(); return; }
+        const previousFocus = document.activeElement;
+        const style = document.createElement('style');
+        style.className = 'zhihuE_SettingStyle';
+        style.textContent = `
+.zhihuE_SettingRoot {--zb-setting-bg:#fff;--zb-setting-text:#283747;--zb-setting-muted:#526476;--zb-setting-line:#d4dce5;--zb-setting-input:#f4f7fa;color-scheme:light;box-sizing:border-box;width:480px;max-width:calc(100vw - 32px);max-height:calc(100dvh - 32px);margin:auto;padding:0;overflow:auto;border:1px solid var(--zb-setting-line);border-radius:16px;background:var(--zb-setting-bg);color:var(--zb-setting-text);box-shadow:0 16px 48px rgba(0,0,0,.24);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;}
+.zhihuE_SettingRoot::backdrop {background:rgba(13,19,27,.65);}
+.zhihuE_SettingHeader {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 22px 12px;}
+.zhihuE_SettingHeader h2 {margin:0;font-size:19px;font-weight:650;color:inherit;}
+.zhihuE_SettingClose {display:grid;place-items:center;flex:none;width:36px;height:36px;padding:0;border:0;border-radius:9px;background:transparent;color:var(--zb-setting-muted);cursor:pointer;}
+.zhihuE_SettingClose:hover {background:var(--zb-setting-input);color:var(--zb-setting-text);}
+.zhihuE_SettingMain {padding:0 22px 22px;}
+.zhihuE_SettingMain > p {margin:0 0 14px;color:var(--zb-setting-muted);font-size:13px;}
+.zhihuE_SettingOption {display:flex;align-items:center;gap:12px;min-height:42px;padding:3px 0;cursor:pointer;}
+.zhihuE_SettingOption input {flex:none;width:17px;height:17px;margin:0;accent-color:#2f6feb;cursor:pointer;}
+.zhihuE_SettingWidth {display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding-top:18px;border-top:1px solid var(--zb-setting-line);}
+.zhihuE_SettingWidth small {display:block;margin-top:2px;color:var(--zb-setting-muted);font-size:12px;}
+.zhihuE_SettingWidth input {box-sizing:border-box;width:108px;max-width:100%;min-height:38px;padding:6px 10px;border:1px solid var(--zb-setting-line);border-radius:8px;background:var(--zb-setting-input);color:var(--zb-setting-text);font:inherit;font-variant-numeric:tabular-nums;}
+.zhihuE_SettingRoot :is(button,input):focus-visible {outline:2px solid #5898ff;outline-offset:3px;}
+[data-theme=dark] .zhihuE_SettingRoot {--zb-setting-bg:#2d333b;--zb-setting-text:#c6d0dc;--zb-setting-muted:#9baabd;--zb-setting-line:#46515f;--zb-setting-input:#252c34;color-scheme:dark;}
+@media(max-width:480px) {.zhihuE_SettingHeader {padding:16px 18px 10px;}.zhihuE_SettingMain {padding:0 18px 18px;}.zhihuE_SettingOption {min-height:44px;}}
+`;
+        document.head.append(style);
+        const dialog = document.createElement('dialog');
+        dialog.className = 'zhihuE_SettingRoot';
+        dialog.setAttribute('aria-labelledby', 'zb-setting-title');
+        dialog.setAttribute('aria-describedby', 'zb-setting-description');
+        dialog.innerHTML = `<div class="zhihuE_SettingHeader"><h2 id="zb-setting-title">${title}</h2><button type="button" class="zhihuE_SettingClose" aria-label="关闭设置" autofocus><svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div><div class="zhihuE_SettingMain"><p id="zb-setting-description">${tips}</p>${menu.map(item => item[0] === 'menu_widescreenDisplayWidth'
+            ? `<label class="zhihuE_SettingWidth"><span>宽屏最大宽度<small id="zb-setting-width-help">640–2400 px，随窗口自动缩小</small></span><input name="${item[0]}" type="number" min="640" max="2400" step="1" inputmode="numeric" aria-describedby="zb-setting-width-help" value="${GM_getValue(item[0])}"></label>`
+            : `<label class="zhihuE_SettingOption"><input name="zhihuE_Setting_Checkbox" type="checkbox" value="${item[0]}" ${GM_getValue(item[0]) ? 'checked' : ''}><span>${item[1]}</span></label>`).join('')}</div>`;
+        document.body.append(dialog);
+        const close = () => dialog.close();
+        dialog.querySelector('.zhihuE_SettingClose').addEventListener('click', close);
+        dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
+        dialog.addEventListener('click', event => {
+            if (event.target !== dialog) return;
+            const rect = dialog.getBoundingClientRect();
+            if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) close();
+        });
+        dialog.addEventListener('close', () => {
+            dialog.remove(); style.remove();
+            if (previousFocus?.isConnected) previousFocus.focus({preventScroll:true});
+        }, {once:true});
+        dialog.querySelectorAll('input[type=checkbox]').forEach(input => {
+            input.addEventListener('change', () => {GM_setValue(input.value, input.checked);registerMenuCommand();addStyle();});
+        });
+        dialog.querySelector('input[type=number]')?.addEventListener('change', event => {
+            const input = event.currentTarget;
+            const width = Math.round(Math.min(2400, Math.max(640, Number(input.value) || 1440)));
+            input.value = String(width);
+            GM_setValue(input.name, input.value);registerMenuCommand();addStyle();
+        });
+        dialog.showModal();
     }
 
 
@@ -494,6 +504,27 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     // 用语义节点识别布局，不依赖每次构建都可能改变的 css-* 类名。
     function updateLeanLayout() {
         const root = document.documentElement;
+        hideSelectionToolbar();
+        prepareAnswerCards();
+        prepareComments();
+        const heading = document.querySelector('.QuestionPage h1');
+        if (heading) {
+            const panel = heading.parentElement;
+            panel.setAttribute('data-zb-question-heading', '');
+            const tags = panel.querySelector('.TopicLink')?.closest('.Tag')?.parentElement;
+            if (tags) tags.setAttribute('data-zb-question-tags', '');
+            const operations = [...panel.children].find(el => el.querySelector('.QuestionHeader-Comment'));
+            if (operations) {
+                operations.setAttribute('data-zb-question-operations', '');
+                const secondary = operations.querySelector('.QuestionHeader-Comment')?.parentElement;
+                if (secondary && secondary !== operations) {
+                    secondary.setAttribute('data-zb-question-secondary', '');
+                    [...secondary.children].forEach(el => {
+                        if (el.tagName === 'SPAN' && !el.querySelector('button,a,input')) el.setAttribute('data-zb-question-stat', '');
+                    });
+                }
+            }
+        }
         const header = document.querySelector('header.LeanAppHeaderBar, header.AppHeader');
         document.querySelectorAll('[data-zb-header-host]').forEach(el => {
             if (el !== header && el !== header?.parentElement) el.removeAttribute('data-zb-header-host');
@@ -531,7 +562,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             });
         });
         document.querySelectorAll('.AnswerItem > div[tabindex="0"]').forEach(el => {
-            if ([...el.querySelectorAll('button')].some(button => button.textContent.includes('更多评论'))) el.setAttribute('data-zb-hot-comment', '');
+            if (el.textContent.includes('更多评论') && el.querySelector('a[href*="/people/"]')) el.setAttribute('data-zb-hot-comment', '');
         });
         if (!isWideLayout() || !root.hasAttribute('data-zb-lean')) return;
         const main = document.querySelector('main.App-main');
@@ -557,6 +588,133 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             for (let el = questionColumn.parentElement; el && !el.matches('.QuestionPage') && el !== main; el = el.parentElement) {
                 el.setAttribute('data-zb-question-wrap', '');
             }
+        }
+    }
+
+    function hideSelectionToolbar() {
+        // 只识别带复制、喜欢、评论和 AI 解释的划词工具条，不拦截文字选择。
+        document.querySelectorAll('svg.ZDI--Repeat24').forEach(icon => {
+            let target = null;
+            for (let el = icon.parentElement, depth = 0; el && depth < 6; el = el.parentElement, depth++) {
+                const text = el.textContent.replace(/\s/g, '');
+                if (text.length > 80) break;
+                if (text.includes('复制') && text.includes('喜欢') && text.includes('评论') && text.includes('AI解释')) target = el;
+            }
+            if (target) target.setAttribute('data-zb-selection-toolbar', '');
+        });
+    }
+
+    function prepareAnswerCards() {
+        document.querySelectorAll('.Question-mainColumn .AnswerItem').forEach(answer => {
+            const card = answer.closest('.List-item') || answer.closest('.AnswerCard') || answer;
+            card.setAttribute('data-zb-answer-card', '');
+            for (let el = card.parentElement; el && !el.matches('.Question-mainColumn'); el = el.parentElement) {
+                el.setAttribute('data-zb-answer-list', '');
+            }
+            prepareAnswerFold(answer);
+        });
+    }
+
+    function prepareComments() {
+        document.querySelectorAll('.Comments-container .CommentContent').forEach(content => {
+            const body = content.parentElement;
+            const row = body.parentElement;
+            body.setAttribute('data-zb-comment-body', '');
+            row.setAttribute('data-zb-comment-row', '');
+            if (body.firstElementChild !== content) body.firstElementChild.setAttribute('data-zb-comment-author', '');
+            if (body.lastElementChild !== content) body.lastElementChild.setAttribute('data-zb-comment-meta', '');
+            let list = null;
+            for (let el = row.parentElement; el && !el.matches('.Comments-container'); el = el.parentElement) {
+                const children = [...el.children].filter(child => child.querySelector('.CommentContent') || child.textContent.trim());
+                if (children.length > 1 && children.every(child => child.querySelector('.CommentContent'))) list = el;
+            }
+            if (list) [...list.children].filter(group => group.querySelector('.CommentContent')).forEach(group => group.setAttribute('data-zb-comment-group', ''));
+        });
+    }
+
+    function prepareAnswerFold(answer) {
+        const inner = answer.querySelector('.RichContent-inner');
+        const rich = inner?.closest('.RichContent');
+        if (!inner || !rich || rich.classList.contains('is-collapsed') || inner.isContentEditable) return;
+        let button = rich.querySelector(':scope > .zb-answer-toggle');
+        // 使用正文实际高度判断，图片加载后再检查；不重复创建展开按钮。
+        if (!button && inner.scrollHeight > 720) {
+            if (!inner.id) {
+                prepareAnswerFold.nextId = (prepareAnswerFold.nextId || 0) + 1;
+                inner.id = `zb-answer-body-${prepareAnswerFold.nextId}`;
+            }
+            inner.setAttribute('data-zb-folded', '');
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'zb-answer-toggle';
+            button.textContent = '展开完整回答';
+            button.setAttribute('aria-controls', inner.id);
+            button.setAttribute('aria-expanded', 'false');
+            const actions = rich.querySelector(':scope > .ContentItem-actions');
+            rich.insertBefore(button, actions);
+            button.addEventListener('click', () => {
+                const wasExpanded = button.getAttribute('aria-expanded') === 'true';
+                inner.toggleAttribute('data-zb-folded', wasExpanded);
+                button.setAttribute('aria-expanded', String(!wasExpanded));
+                button.textContent = wasExpanded ? '展开完整回答' : '收起回答';
+                syncAnswerFoldAccess(inner);
+                if (wasExpanded && inner.getBoundingClientRect().top < 0) {
+                    answer.scrollIntoView({block: 'start'});
+                }
+            });
+        }
+        prepareAnswerFold.observed ||= new WeakSet();
+        if (!prepareAnswerFold.observed.has(inner)) {
+            prepareAnswerFold.observer ||= new ResizeObserver(() => scheduleUpdate());
+            prepareAnswerFold.observer.observe(inner);
+            prepareAnswerFold.observed.add(inner);
+        }
+        if (button) syncAnswerFoldAccess(inner);
+    }
+
+    // 仅让裁切线下的节点退出辅助阅读和 Tab 顺序，保留可见摘要中的链接。
+    function syncAnswerFoldAccess(inner) {
+        syncAnswerFoldAccess.saved ||= new WeakMap();
+        const previous = syncAnswerFoldAccess.saved.get(inner);
+        previous?.forEach((attributes, el) => {
+            for (const [name, value] of Object.entries(attributes)) {
+                if (value === null) el.removeAttribute(name);
+                else el.setAttribute(name, value);
+            }
+        });
+        syncAnswerFoldAccess.saved.delete(inner);
+        if (!inner.hasAttribute('data-zb-folded')) return;
+        const limit = inner.getBoundingClientRect().bottom;
+        const saved = new Map();
+        const remember = (el, name, value) => {
+            if (!saved.has(el)) saved.set(el, {});
+            const attributes = saved.get(el);
+            if (!(name in attributes)) attributes[name] = el.getAttribute(name);
+            el.setAttribute(name, value);
+        };
+        const visit = el => {
+            const rect = el.getBoundingClientRect();
+            if (!rect.width && !rect.height) return;
+            if (rect.top >= limit - 1) {
+                remember(el, 'inert', '');
+                remember(el, 'aria-hidden', 'true');
+                return;
+            }
+            if (rect.bottom > limit) [...el.children].forEach(visit);
+        };
+        [...inner.children].forEach(visit);
+        inner.querySelectorAll('a[href],button,input,select,textarea,[tabindex],[contenteditable=true]').forEach(el => {
+            if (el.getBoundingClientRect().bottom > limit && !el.closest('[inert]')) remember(el, 'tabindex', '-1');
+        });
+        syncAnswerFoldAccess.saved.set(inner, saved);
+        if (!syncAnswerFoldAccess.listened) syncAnswerFoldAccess.listened = new WeakSet();
+        if (!syncAnswerFoldAccess.listened.has(inner)) {
+            inner.addEventListener('focusin', event => {
+                if (inner.hasAttribute('data-zb-folded') && event.target.getBoundingClientRect().bottom > inner.getBoundingClientRect().bottom) {
+                    inner.closest('.RichContent')?.querySelector(':scope > .zb-answer-toggle')?.click();
+                }
+            });
+            syncAnswerFoldAccess.listened.add(inner);
         }
     }
 
@@ -592,8 +750,10 @@ html[data-zb-lean] .TopstoryItem .ContentItem-title {margin: 0 0 10px !important
 html[data-zb-lean] .TopstoryItem .RichContent-inner {line-height: 1.8;}
 /* 只隐藏看山狗入口，保留正常的回到顶部等工具。 */
 .KanshanCornerButton, .CornerAnimayedFlex--kanshanEntry {display: none !important;}
+/* 划词浮条的当前结构直接屏蔽；语义识别兼容构建类名变化。 */
+[data-zb-selection-toolbar], .css-1qgg1gw:has(.ZDI--Repeat24):has(.ZDI--Heart24):has(.ZDI--ChatBubble24) {display: none !important;}
 /* 回答间文字链广告、侧栏广告和信息流广告。 */
-.pc-article-answer-text-chain, .Pc-card.Card, .TopstoryItem--advertCard,
+.pc-article-answer-text-chain, .pc-article-answer-big-img, .Pc-card.Card, .TopstoryItem--advertCard,
 .Pc-Business-Card-PcTopFeedBanner, .Topstory-advertCard, .Pc-feedAd-container {display: none !important;}
 html[data-zb-question][data-zb-wide-layout][data-zb-lean] .QuestionPage {width: 100% !important; max-width: var(--zb-width); margin-inline: auto;}
 html[data-zb-question][data-zb-wide-layout][data-zb-lean] [data-zb-question-wrap] {width: 100% !important; min-width: 0 !important; max-width: none !important; box-sizing: border-box;}
@@ -602,6 +762,44 @@ html[data-zb-question][data-zb-lean] .Question-mainColumn .Card {border-radius: 
 html[data-zb-question][data-zb-lean] .Question-mainColumn .AnswerItem {padding: 22px 24px; box-sizing: border-box;}
 html[data-zb-question][data-zb-lean] .Question-mainColumn .RichContent-inner {font-size: 17px; line-height: 1.85; overflow-wrap: anywhere;}
 html[data-zb-question][data-zb-lean] .Question-mainColumn .RichContent-inner img {max-width: 100%; height: auto;}
+html[data-zb-question] [data-zb-answer-list] {background: transparent !important; box-shadow: none !important;}
+html[data-zb-question] [data-zb-answer-card] {margin-block: 16px !important; border: 1px solid rgba(133,144,166,.16) !important; border-radius: 16px !important; box-shadow: none !important; background: #fff !important;}
+html[data-zb-question] [data-zb-answer-card]:not(.AnswerItem) {padding: 0 !important;}
+html[data-zb-question] [data-zb-answer-card] .AnswerItem {padding: 24px !important;}
+html[data-zb-question][data-theme=dark] [data-zb-answer-card] {background: #2d333b !important; border-color: #3b444f !important;}
+html[data-zb-question] [data-zb-question-heading] {margin: 16px auto 20px; padding: 24px 28px; border-radius: 18px; border: 1px solid rgba(133,144,166,.18); box-sizing: border-box;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] {background: #2d333b !important; border-color: #3b444f;}
+html[data-zb-question] [data-zb-question-heading] h1 {margin: 16px 0 20px !important; font-size: clamp(22px, 2vw, 28px) !important; line-height: 1.5 !important; letter-spacing: .2px; font-weight: 650;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] h1 {color: #dce5f0 !important;}
+html[data-zb-question] [data-zb-question-tags] {display: flex; flex-wrap: wrap; gap: 8px;}
+html[data-zb-question] [data-zb-question-heading] .Tag {margin: 0 !important; border-radius: 8px !important; padding: 2px 6px !important; height: auto !important;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] :is(.Tag,.Tag-content,.TopicLink,.TopicLink > div) {background: #344255 !important; color: #b9d3f3 !important; border: 0 !important;}
+html[data-zb-question] [data-zb-question-heading] a[href*="/topic/"]:has(img) {margin-block: 18px; padding: 12px; border-radius: 12px !important; box-sizing: border-box;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] a[href*="/topic/"]:has(img) {background: #293039 !important;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] a[href*="/topic/"]:has(img) button {background: #354151 !important; color: #c6d0dc !important; border: 1px solid #465363 !important;}
+html[data-zb-question] [data-zb-question-heading] button {border-radius: 9px !important; min-height: 34px;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] .Button--plain {color: #aab8ca !important;}
+html[data-zb-question][data-theme=dark] [data-zb-question-heading] .Button--grey {border-color: #526071 !important; color: #c6d0dc !important;}
+html[data-zb-question] [data-zb-question-operations] {display: flex !important; flex-direction: column; align-items: stretch !important; gap: 10px; margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(133,144,166,.16);}
+html[data-zb-question] [data-zb-question-operations] .QuestionButtonGroup {display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 !important;}
+html[data-zb-question] [data-zb-question-operations] .QuestionButtonGroup > button {margin: 0 !important; min-height: 38px; padding-inline: 16px; font-size: 14px;}
+html[data-zb-question] [data-zb-question-operations] .WriteAnswerButton {order: -1; font-weight: 600;}
+html[data-zb-question] [data-zb-question-heading] [data-zb-question-operations] .QuestionButtonGroup-invite {border-color: transparent !important; background: transparent !important; color: #526476; padding-inline: 8px;}
+html[data-zb-question] [data-zb-question-heading] [data-zb-question-operations] .QuestionButtonGroup-invite:hover {background: rgba(88,152,255,.08) !important;}
+html[data-zb-question] [data-zb-question-secondary] {display: flex !important; flex-wrap: wrap; align-items: center; justify-content: flex-start !important; gap: 4px 16px; min-width: 0; width: 100%; margin: 0 !important; font-size: 13px;}
+html[data-zb-question] [data-zb-question-secondary] > * {margin: 0 !important; flex: 0 0 auto;}
+html[data-zb-question] [data-zb-question-secondary] button {font-size: 13px; min-height: 34px;}
+html[data-zb-question] [data-zb-question-secondary] button[aria-label="更多"] {min-width: 34px; padding-inline: 8px;}
+html[data-zb-question] [data-zb-question-stat] {order: 1; display: inline-flex; align-items: center; gap: 5px; color: #526476; font-size: 13px; font-variant-numeric: tabular-nums;}
+html[data-zb-question][data-theme=dark] :is([data-zb-question-stat],.QuestionButtonGroup-invite) {color: #9baabd !important;}
+html[data-zb-question] [data-zb-question-heading] button:focus-visible {outline: 2px solid #5898ff; outline-offset: 3px;}
+html[data-zb-question] .RichContent-inner[data-zb-folded] {position: relative; max-height: 560px !important; overflow: hidden !important;}
+html[data-zb-question] .RichContent-inner[data-zb-folded]::after {content: ''; position: absolute; inset: auto 0 0; height: 80px; pointer-events: none; background: linear-gradient(transparent, #fff);}
+html[data-zb-question][data-theme=dark] .RichContent-inner[data-zb-folded]::after {background: linear-gradient(transparent, #2d333b);}
+.zb-answer-toggle {display: block; width: 100%; margin: 12px 0 18px; padding: 12px; border: 1px solid rgba(133,144,166,.22); border-radius: 10px; background: transparent; color: #1769c2; font-size: 15px; cursor: pointer;}
+html[data-theme=dark] .zb-answer-toggle {color: #79b8ff; border-color: #46505e;}
+.zb-answer-toggle:hover {background: rgba(88,152,255,.08);}
+.zb-answer-toggle:focus-visible {outline: 2px solid #5898ff; outline-offset: 2px;}
 html[data-zb-lean][data-theme=dark] body {background: #22272e !important; color: #adbac7 !important;}
 html[data-zb-lean][data-theme=dark] [data-zb-header-host],
 html[data-zb-lean][data-theme=dark] .LeanAppHeaderBar,
@@ -615,21 +813,51 @@ html[data-zb-lean][data-theme=dark] header nav a[aria-current=page] {color: #589
 html[data-zb-lean][data-theme=dark] .WriteArea [class] {color: inherit;}
 /* 新评论组件大量使用构建类名；以稳定的评论根节点约束配色。 */
 html[data-theme=dark] .Comments-container,
-html[data-theme=dark] [data-zb-hot-comment] {background: #252c35 !important; color: #e6edf3 !important; border-color: #444c56 !important; border-radius: 12px;}
+html[data-theme=dark] [data-zb-hot-comment] {background: #2d333b !important; color: #c6d0dc !important; border: 0 !important; border-radius: 12px; box-shadow: none !important;}
+html[data-theme=dark] .Comments-container {margin-top: 16px; padding-top: 14px; border-top: 1px solid #414b58 !important;}
 html[data-theme=dark] .Comments-container :is(div,span,p,a,button,label,h2,h3,section),
-html[data-theme=dark] [data-zb-hot-comment] :is(div,span,p,a,button) {color: #e6edf3 !important; border-color: #444c56 !important;}
+html[data-theme=dark] [data-zb-hot-comment] :is(div,span,p,a,button) {color: #c6d0dc !important; border-color: #414b58 !important;}
 html[data-theme=dark] .Comments-container div,
 html[data-theme=dark] [data-zb-hot-comment] div {background-color: transparent !important;}
+html[data-theme=dark] .Comments-container :is(div,section) {border: 0 !important; box-shadow: none !important;}
 html[data-theme=dark] .Comments-container .CommentContent,
-html[data-theme=dark] .Comments-container .CommentContent :is(p,span) {color: #e6edf3 !important; line-height: 1.75;}
+html[data-theme=dark] .Comments-container .CommentContent :is(p,span) {color: #c6d0dc !important; line-height: 1.8; font-size: 15px;}
 html[data-theme=dark] .Comments-container a[href*="/people/"],
-html[data-theme=dark] [data-zb-hot-comment] a[href*="/people/"] {color: #f0f6fc !important; font-weight: 600;}
+html[data-theme=dark] [data-zb-hot-comment] a[href*="/people/"] {color: #d7e0eb !important; font-weight: 600;}
+html[data-theme=dark] .Question-mainColumn .RichContent-inner,
+html[data-theme=dark] .Question-mainColumn .RichContent-inner .RichText {color: #c6d0dc !important;}
 html[data-theme=dark] .Comments-container .CommentContent a,
 html[data-theme=dark] .RichContent .RichText a {color: #79b8ff !important;}
 html[data-theme=dark] .Comments-container :is(time,small),
 html[data-theme=dark] .Comments-container div:has(> .CommentContent) > div:last-child,
-html[data-theme=dark] .Comments-container div:has(> .CommentContent) > div:last-child :is(span,button) {color: #aab7c8 !important;}
-html[data-theme=dark] .Comments-container :is(input,textarea,[contenteditable=true]) {background: #22272e !important; color: #e6edf3 !important; caret-color: #e6edf3; border-color: #596574 !important;}
+html[data-theme=dark] .Comments-container div:has(> .CommentContent) > div:last-child :is(span,button) {color: #9baabd !important;}
+html[data-theme=dark] .Comments-container :is(input,textarea,[contenteditable=true]) {background: #293039 !important; color: #c6d0dc !important; caret-color: #c6d0dc; border: 1px solid #46515f !important; border-radius: 10px; padding: 10px 12px; box-shadow: none !important;}
+html[data-theme=dark] .Comments-container :is(input,textarea,[contenteditable=true]):focus {outline: 2px solid #5898ff; outline-offset: 2px;}
+html[data-theme=dark] .Comments-container button:disabled {color: #8493a8 !important; opacity: .65;}
+html[data-theme=dark] .Comments-container .CommentContent p {margin-block: 4px;}
+/* 评论采用适合连续阅读的宽度，避免大屏上一行文字过长。 */
+.Comments-container {width: 100%; max-width: 980px; margin-inline: auto !important; box-sizing: border-box;}
+.Comments-container [data-zb-comment-row] {padding-block: 9px; gap: 12px; align-items: flex-start;}
+.Comments-container [data-zb-comment-body] {min-width: 0; flex: 1;}
+.Comments-container [data-zb-comment-author] {margin-bottom: 4px; font-size: 14px; line-height: 1.6;}
+.Comments-container .CommentContent {font-size: 15px; line-height: 1.8;}
+.Comments-container [data-zb-comment-meta] {margin-top: 5px; font-size: 13px; line-height: 1.6;}
+.Comments-container [data-zb-comment-group] {padding-block: 6px;}
+.Comments-container [data-zb-comment-group] + [data-zb-comment-group] {border-top: 1px solid #dce2ea !important;}
+html[data-theme=dark] .Comments-container [data-zb-comment-group] + [data-zb-comment-group] {border-top-color: #3b4551 !important;}
+.Comments-container [data-zb-comment-group] > div:not(:first-child) {margin-left: 0 !important;}
+.Comments-container [data-zb-comment-row] img.Avatar {border-radius: 50%;}
+.Comments-container :is(button,a):focus-visible {outline: 2px solid #5898ff; outline-offset: 3px; border-radius: 4px;}
+/* Draft 的提示文字不在可编辑节点内，需要与输入文字使用相同的起点。 */
+.Comments-container .DraftEditor-root {position: relative; font-family: inherit; font-size: 14px; line-height: 24px;}
+.Comments-container .DraftEditor-root .public-DraftEditor-content {box-sizing: border-box; width: 100%; min-height: 46px; padding: 10px 12px; font-family: inherit; font-size: 14px; line-height: 24px;}
+.Comments-container .DraftEditor-root .public-DraftStyleDefault-block {margin: 0; font-size: inherit; line-height: 24px;}
+.Comments-container .public-DraftEditorPlaceholder-root {position: absolute; top: 11px; left: 13px; right: 13px; margin: 0; padding: 0; font-family: inherit; font-size: 14px; line-height: 24px; pointer-events: none;}
+.Comments-container .public-DraftEditorPlaceholder-inner {font-family: inherit; font-size: 14px; line-height: 24px;}
+html[data-theme=dark] .Comments-container .public-DraftEditorPlaceholder-inner {color: #9baabd !important;}
+.Comments-container .Button--secondary {display: inline-flex; align-items: center; justify-content: center; gap: 4px; box-sizing: border-box; height: 34px; min-height: 34px; padding: 6px 10px; border-radius: 8px; font-family: inherit; font-size: 13px; font-weight: 400; line-height: 20px; vertical-align: middle;}
+.Comments-container .Button--secondary > span {display: inline-flex; align-items: center; height: auto; line-height: 20px;}
+.Comments-container .Button--secondary svg {flex-shrink: 0; width: 18px; height: 18px; vertical-align: middle;}
 html[data-theme=dark] .Comments-container .Button--secondary {background: #343d49 !important; color: #dce6f0 !important;}
 html[data-theme=dark] .Comments-container .Button--primary {background: #2f6feb !important; color: #fff !important;}
 html[data-theme=dark] .QuestionPage a[href*="/topic/"]:has(img) {background: #2d333b !important; border: 1px solid #444c56; border-radius: 12px;}
@@ -638,6 +866,13 @@ html[data-theme=dark] .LeanAppHeaderBar :is(.Messages-icon,.Notifications-icon) 
 [data-zb-header-host] {transition: transform .18s ease !important;}
 html[data-zb-header-hidden] [data-zb-header-host]:not(:focus-within):not(:hover) {transform: translateY(-110%) !important; pointer-events: none;}
 @media (max-width: 700px) {
+    html[data-zb-question] [data-zb-question-heading] {padding: 18px;}
+    html[data-zb-question] [data-zb-question-operations] .QuestionButtonGroup {gap: 8px;}
+    html[data-zb-question] [data-zb-question-operations] .QuestionButtonGroup > button {min-height: 40px; padding-inline: 12px;}
+    html[data-zb-question] [data-zb-question-secondary] {gap: 2px 12px;}
+    .Comments-container [data-zb-comment-group] > div:not(:first-child) {margin-left: 0 !important;}
+    html[data-zb-question] .RichContent-inner[data-zb-folded] {max-height: 420px !important;}
+    html[data-zb-question] [data-zb-answer-card] .AnswerItem {padding: 18px !important;}
     html[data-zb-home-wide][data-zb-lean] .Topstory-mainColumn {padding-inline: 8px !important;}
     html[data-zb-lean] .LeanAppHeaderBar > div {padding-inline: 12px !important;}
 }
