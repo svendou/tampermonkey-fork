@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.1.1
+// @version      0.1.2
 // @author       sven
-// @description  新版首页宽屏、圆角卡片、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
+// @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
 // @match        *://zhuanlan.zhihu.com/*
 // @exclude      https://www.zhihu.com/signin*
@@ -486,7 +486,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         // 隐藏文章开头大图
         if (menu_value('menu_postimg')) style += style_2;
 
-        style += leanStyles();
+        style += leanStyles() + searchStyles();
         if (style_Add.textContent !== style) style_Add.textContent = style;
     }
 
@@ -504,6 +504,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     // 用语义节点识别布局，不依赖每次构建都可能改变的 css-* 类名。
     function updateLeanLayout() {
         const root = document.documentElement;
+        prepareSearchLayout();
         hideSelectionToolbar();
         prepareAnswerCards();
         prepareComments();
@@ -589,6 +590,65 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
                 el.setAttribute('data-zb-question-wrap', '');
             }
         }
+    }
+
+    // 搜索页的列容器和侧栏已改版：沿稳定的 SearchMain / SearchTabs 标记定位。
+    function prepareSearchLayout() {
+        const root = document.documentElement;
+        root.toggleAttribute('data-zb-search', location.pathname === '/search');
+        if (location.pathname !== '/search') return;
+        const main = document.querySelector('main.App-main');
+        const column = main?.querySelector('.SearchMain');
+        const container = main?.querySelector('.Search-container');
+        if (!main || !column || !container) return;
+        for (let el = column.parentElement; el && el !== container; el = el.parentElement) {
+            el.setAttribute('data-zb-search-column', '');
+        }
+        const tabs = main.querySelector('.SearchTabs');
+        for (let el = tabs?.parentElement; el && el !== main; el = el.parentElement) {
+            el.setAttribute('data-zb-search-wrap', '');
+        }
+        // 只隐藏该搜索主列旁、确实包含热搜的侧栏。
+        for (let el = main.parentElement, depth = 0; el && depth < 4; el = el.parentElement, depth++) {
+            [...el.children].filter(child => child.tagName === 'ASIDE' && child.querySelector('.HotSearchCard')).forEach(sidebar => {
+                sidebar.setAttribute('data-zb-search-sidebar', '');
+            });
+        }
+        const lists = column.querySelectorAll('[data-za-detail-view-path-module="SearchResultList"]');
+        lists.forEach(list => {
+            // AI 总结有独立的列表项容器。按标题识别，避免隐藏普通结果中提到 AI 的正文。
+            [...list.children].forEach(item => {
+                if (item.matches('.Card,.SearchResult-Card') || item.querySelector('.ContentItem,.SearchResult-Card')) return;
+                const summary = [...item.querySelectorAll('div,span,a')].some(el =>
+                    !el.childElementCount && /^AI\s*智能总结$/.test(el.textContent.trim()));
+                if (summary) item.setAttribute('data-zb-search-ai', '');
+            });
+        });
+        // 仅修饰最外层卡片，专业聚合卡内部的嵌套结果不重复加边框和留白。
+        column.querySelectorAll('.Card').forEach(card => {
+            const nested = card.parentElement?.closest('.Card');
+            if (nested && column.contains(nested)) {
+                card.removeAttribute('data-zb-search-card');
+                card.removeAttribute('data-zb-search-special');
+                return;
+            }
+            card.setAttribute('data-zb-search-card', '');
+            const special = !card.matches('.SearchResult-Card') && !!card.querySelector(':scope > .List-item > [role=button]');
+            // 读取原生选中颜色再应用配色，保留聚合卡的当前标签状态。
+            card.removeAttribute('data-zb-search-special');
+            if (special) card.querySelectorAll('[role=button]').forEach(button => {
+                const rgb = getComputedStyle(button).color.match(/[\d.]+/g)?.map(Number) || [];
+                button.toggleAttribute('data-zb-search-selected', rgb[2] > rgb[0] * 1.5 && rgb[2] > rgb[1] * 1.1);
+            });
+            card.toggleAttribute('data-zb-search-special', special);
+            if (special) {
+                const heading = card.querySelector(':scope > .List-item > [role=button]');
+                heading.setAttribute('data-zb-search-special-heading', '');
+                heading.querySelectorAll('div').forEach(el => {
+                    if (!el.childElementCount && el.textContent.trim()) el.setAttribute('data-zb-search-badge', '');
+                });
+            }
+        });
     }
 
     function hideSelectionToolbar() {
@@ -716,6 +776,95 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             });
             syncAnswerFoldAccess.listened.add(inner);
         }
+    }
+
+    function searchStyles() {
+        return `
+/* 2026 搜索页：统一导航、结果和筛选，隐藏 AI 总结。 */
+html[data-zb-search] {
+    --zb-search-bg: #fff; --zb-search-text: #253343; --zb-search-muted: #64748b;
+    --zb-search-line: #e3e8ef; --zb-search-soft: #f3f6fa; --zb-search-accent: #2563eb;
+    --zb-search-selected: #eaf1ff;
+}
+html[data-zb-search][data-theme=dark] {
+    --zb-search-bg: #2d333b; --zb-search-text: #d3dce7; --zb-search-muted: #9baabd;
+    --zb-search-line: #414b58; --zb-search-soft: #252c35; --zb-search-accent: #79b8ff;
+    --zb-search-selected: #33465e;
+}
+html[data-zb-search] [data-zb-search-ai] {display: none !important;}
+/* 首屏 CSS 回退，异步挂载后由语义标记接管。 */
+html[data-zb-search] [data-za-detail-view-path-module=SearchResultList] > .css-9x92ah:not(:has(.ContentItem)) {display: none !important;}
+html[data-zb-search][data-zb-wide-layout] [data-zb-search-sidebar] {display: none !important;}
+html[data-zb-search][data-zb-wide-layout] main.App-main {
+    width: 100% !important; max-width: var(--zb-width) !important; margin-inline: auto !important; min-width: 0 !important;
+}
+html[data-zb-search] [data-zb-search-wrap] {box-sizing: border-box; min-width: 0 !important;}
+html[data-zb-search][data-zb-wide-layout] [data-zb-search-wrap],
+html[data-zb-search][data-zb-wide-layout] .Search-container,
+html[data-zb-search][data-zb-wide-layout] [data-zb-search-column],
+html[data-zb-search][data-zb-wide-layout] .SearchMain {
+    width: 100% !important; max-width: none !important; min-width: 0 !important; padding-inline: 0 !important; margin-inline: 0 !important; box-sizing: border-box;
+}
+html[data-zb-search] .SearchMain :is(.ListShortcut,.List) {width: 100% !important; min-width: 0 !important; background: transparent !important; box-shadow: none !important;}
+html[data-zb-search] main .SearchTabs {margin-bottom: 18px;}
+html[data-zb-search] .SearchTabs {
+    width: 100% !important; box-sizing: border-box; padding: 4px 18px !important;
+    border: 1px solid var(--zb-search-line); border-radius: 16px; background: var(--zb-search-bg) !important; box-shadow: none !important;
+}
+html[data-zb-search] .SearchTabs-inner {width: 100% !important; min-width: 0 !important; padding: 0 !important; box-sizing: border-box;}
+html[data-zb-search] .SearchTabs-actions {display: flex; align-items: center; gap: 16px; width: 100% !important; min-width: 0;}
+html[data-zb-search] .SearchTabs .Tabs {display: flex; flex: 1 1 0%; min-width: 0; overflow-x: auto; white-space: nowrap; scrollbar-width: thin;}
+html[data-zb-search] .SearchTabs .Tabs > span {flex: none;}
+html[data-zb-search] .SearchTabs .Tabs-item {padding-inline: 12px !important;}
+html[data-zb-search] .SearchTabs .Tabs-link {color: var(--zb-search-muted) !important; font-size: 15px;}
+html[data-zb-search] .SearchTabs .Tabs-link:is(.is-active,:hover) {color: var(--zb-search-accent) !important;}
+html[data-zb-search] .SearchTabs-customFilterEntry {flex: none; color: var(--zb-search-muted) !important; cursor: pointer; padding: 8px; border-radius: 8px;}
+html[data-zb-search] .SearchTabs-customFilterEntry:hover {background: var(--zb-search-soft); color: var(--zb-search-accent) !important;}
+html[data-zb-search] .SearchTabs-customFilter {width: 100% !important; padding: 12px 0 6px !important; border-top: 1px solid var(--zb-search-line); box-sizing: border-box;}
+html[data-zb-search] .SearchTabs-customFilter--group {display: flex; flex-wrap: wrap; gap: 8px; height: auto !important; margin: 0 0 8px !important;}
+html[data-zb-search] .SearchTabs-customFilter--group > li {flex: none; width: auto !important; height: auto !important; margin: 0 !important;}
+html[data-zb-search] .SearchTabs-customFilter--tag {color: var(--zb-search-muted) !important; border-radius: 8px !important; padding: 6px 12px; min-height: 32px; line-height: 20px; box-sizing: border-box;}
+html[data-zb-search] .SearchTabs-customFilter--tag:is(.tag-selected,:hover) {color: var(--zb-search-accent) !important; background: var(--zb-search-selected) !important;}
+html[data-zb-search] [data-zb-search-card] {
+    margin: 0 0 16px !important; padding: 24px !important; border: 1px solid var(--zb-search-line) !important;
+    border-radius: 16px !important; background: var(--zb-search-bg) !important; color: var(--zb-search-text) !important; box-shadow: none !important; box-sizing: border-box;
+}
+html[data-zb-search] [data-zb-search-card] > .List-item {padding: 0 !important; border: 0 !important;}
+html[data-zb-search] [data-zb-search-card] .ContentItem-title {margin: 0 0 12px !important; font-size: 18px; line-height: 1.6; overflow-wrap: anywhere;}
+html[data-zb-search] [data-zb-search-card] .ContentItem-title a {color: var(--zb-search-text) !important;}
+html[data-zb-search] [data-zb-search-card] .ContentItem-title a:hover {color: var(--zb-search-accent) !important;}
+html[data-zb-search] [data-zb-search-card] .RichContent-inner {line-height: 1.85; color: var(--zb-search-text) !important; overflow-wrap: anywhere;}
+html[data-zb-search] [data-zb-search-card] .ContentItem-actions {margin: 14px 0 0 !important; padding: 0 !important; background: transparent !important; color: var(--zb-search-muted) !important; flex-wrap: wrap; gap: 6px 14px;}
+html[data-zb-search] [data-zb-search-card] .RichContent-cover {border-radius: 10px; overflow: hidden;}
+html[data-zb-search] [data-zb-search-card] .Highlight em {color: #c2413b !important; font-style: normal;}
+html[data-zb-search][data-theme=dark] [data-zb-search-card] .Highlight em {color: #ff9990 !important;}
+html[data-zb-search] [data-zb-search-card] .SearchItem-avatarWrapper img {border-radius: 12px;}
+html[data-zb-search] [data-zb-search-card] .SearchItem-meta {color: var(--zb-search-text) !important;}
+html[data-zb-search] [data-zb-search-card] :is(.ContentItem-status,.Search-statusLink) {color: var(--zb-search-muted) !important;}
+/* 专业等聚合卡：修复亮色标签、分隔线与不可读的次级文字。 */
+html[data-zb-search] [data-zb-search-special] {line-height: 1.75;}
+html[data-zb-search] [data-zb-search-special] [role=button] {color: var(--zb-search-text) !important; border-color: var(--zb-search-line) !important;}
+html[data-zb-search] [data-zb-search-special] [role=button]:not(:has([role=button])) {background: var(--zb-search-soft) !important; border-radius: 8px; padding: 5px 10px;}
+html[data-zb-search] [data-zb-search-special] [role=button][data-zb-search-special-heading] {padding: 0 0 18px !important; background: transparent !important; font-size: 21px; border-radius: 0; border-bottom: 1px solid var(--zb-search-line);}
+html[data-zb-search] [data-zb-search-special] [data-zb-search-badge] {background: var(--zb-search-soft) !important; color: var(--zb-search-muted) !important; padding: 2px 6px; border-radius: 5px; font-size: 12px;}
+html[data-zb-search] [data-zb-search-special] div {border-color: var(--zb-search-line) !important;}
+html[data-zb-search] [data-zb-search-special] [role=button]:hover {color: var(--zb-search-accent) !important;}
+html[data-zb-search] [data-zb-search-special] [role=button][data-zb-search-selected] {color: var(--zb-search-accent) !important; background: var(--zb-search-selected) !important;}
+html[data-zb-search] [data-zb-search-special] .Card {background: transparent !important; box-shadow: none !important; border-radius: 0 !important;}
+html[data-zb-search] [data-zb-search-special] .SearchResult-Card {margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--zb-search-line);}
+html[data-zb-search] [data-zb-search-special] .SearchResult-Card .List-item {padding: 0 !important;}
+html[data-zb-search] [data-zb-search-special] em {color: var(--zb-search-accent) !important; font-style: normal;}
+html[data-zb-search] .SearchTabs :is(a,[role=button]):focus-visible,
+html[data-zb-search] [data-zb-search-card] :is(a,button,[role=button]):focus-visible {outline: 2px solid var(--zb-search-accent); outline-offset: 3px;}
+@media (max-width: 700px) {
+    html[data-zb-search][data-zb-wide-layout][data-zb-lean] [data-zb-shell] {padding-inline: 10px;}
+    html[data-zb-search] .SearchTabs {padding-inline: 8px !important; border-radius: 12px;}
+    html[data-zb-search] .SearchTabs-actions {gap: 4px;}
+    html[data-zb-search] .SearchTabs .Tabs-item {padding-inline: 9px !important;}
+    html[data-zb-search] [data-zb-search-card] {padding: 18px !important; border-radius: 12px !important; margin-bottom: 12px !important;}
+    html[data-zb-search] [data-zb-search-card] .ContentItem-title {font-size: 17px;}
+}
+`;
     }
 
     function leanStyles() {
