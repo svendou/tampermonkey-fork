@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.1.2
+// @version      0.1.3
 // @author       sven
 // @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
@@ -44,21 +44,79 @@
     }
     registerMenuCommand();
     if (window.onurlchange === undefined) {addUrlChangeEvent();} // Tampermonkey v4.11 版本添加的 onurlchange 事件 grant，可以监控 pjax 等网页的 URL 变化
-    addStyle();
-    window.addEventListener('urlchange', scheduleUpdate);
-    window.addEventListener('popstate', scheduleUpdate);
-    document.addEventListener('selectionchange', scheduleUpdate);
-    // 新版首页异步挂载，监听结构变化，并合并同一批更新。
+    // 样式只在设置或路由改变时重建；异步内容仅处理新增/改变的子树。
     let updateTimer = 0;
-    const layoutObserver = new MutationObserver(scheduleUpdate);
-    layoutObserver.observe(document.documentElement, {childList: true, subtree: true});
+    let layoutDirty = false, pageDirty = false, selectionFrame = 0;
+    const changedRoots = new Set();
+    const layoutObserver = new MutationObserver(records => {
+        for (const record of records) {
+            const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+            if (!target || target.closest('style,script,.zb-answer-toggle')) continue;
+            if (record.addedNodes.length && !record.removedNodes.length &&
+                [...record.addedNodes].every(node => node.nodeType === 1 && node.matches('style,script,.zb-answer-toggle'))) continue;
+            for (const node of record.removedNodes) releaseAnswerFolds(node);
+            for (const node of record.addedNodes) {
+                const element = node.nodeType === 1 ? node : node.parentElement;
+                if (element && !element.matches('style,script,.zb-answer-toggle')) changedRoots.add(element);
+            }
+            // 正文替换、原生展开和评论更新也可能发生在已有卡片内部。
+            if (!record.addedNodes.length && target.closest('.AnswerItem,.TopstoryItem,.Comments-container,.SearchMain')) changedRoots.add(target);
+            if (!target.closest('.Question-mainColumn,.Topstory-mainColumn,.SearchMain,.Comments-container')) layoutDirty = true;
+        }
+        if (changedRoots.size || layoutDirty) scheduleUpdate();
+    });
+    layoutObserver.observe(document.documentElement, {childList: true, subtree: true, characterData: true});
+    // 知乎异步挂载时可能重置主题，只同步根节点，无需重扫回答或重建样式。
+    const themeObserver = new MutationObserver(() => {
+        const theme = menu_value('menu_darkMode') && menu_value('menu_darkModeType') === 1 ? 'dark' : 'light';
+        if (getTheme() !== theme) setTheme(theme);
+    });
+    themeObserver.observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
+    window.addEventListener('urlchange', schedulePageUpdate);
+    window.addEventListener('popstate', schedulePageUpdate);
+    document.addEventListener('selectionchange', () => {
+        if (selectionFrame) return;
+        selectionFrame = requestAnimationFrame(() => {
+            selectionFrame = 0;
+            hideSelectionToolbar();
+        });
+    });
+    // 裁切后的正文高度不一定随图片变化，图片加载只复查所属回答。
+    document.addEventListener('load', event => {
+        if (event.target.tagName !== 'IMG') return;
+        const answer = event.target.closest('.Question-mainColumn .AnswerItem');
+        if (answer) queueAnswerFold(answer);
+    }, true);
     function scheduleUpdate() {
         if (updateTimer) return;
         updateTimer = window.setTimeout(() => {
             updateTimer = 0;
-            addStyle();
+            const roots = [...changedRoots];
+            const refreshPage = pageDirty, refreshLayout = layoutDirty;
+            changedRoots.clear();
+            pageDirty = layoutDirty = false;
+            if (refreshPage) {
+                addStyle();
+                return;
+            }
+            if (refreshLayout) updateLeanLayout();
+            // 同批次父子节点只处理一次，避免重复遍历嵌套子树。
+            const rootSet = new Set(roots);
+            for (const root of roots) {
+                if (!root.isConnected) continue;
+                let covered = false;
+                for (let parent = root.parentElement; parent; parent = parent.parentElement) {
+                    if (rootSet.has(parent)) { covered = true; break; }
+                }
+                if (!covered) updateContent(root);
+            }
         }, 120);
     }
+    function schedulePageUpdate() {
+        pageDirty = true;
+        scheduleUpdate();
+    }
+    addStyle();
     // 向下翻时自动隐藏顶栏
     if (menu_value('menu_hideTitle')) hideTitle();
 
@@ -181,6 +239,7 @@
         const width = Number(GM_getValue('menu_widescreenDisplayWidth'));
         if (!Number.isFinite(width) || width < 640 || width > 2400) GM_setValue('menu_widescreenDisplayWidth', '1440');
         updateLeanLayout();
+        updateContent(document);
         let style = `/* 屏蔽登录提示（问题页中间的元素） */
 .Question-mainColumnLogin {display: none !important;}
 /* 屏蔽回答页/首页广告 */
@@ -501,13 +560,39 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         return false;
     }
 
+    // 包含子树本身和所属卡片，兼容先创建空壳、随后填充正文的异步渲染。
+    function forEachWithin(scope, selector, callback) {
+        const matches = new Set(scope.querySelectorAll(selector));
+        if (scope.nodeType === 1) {
+            const owner = scope.closest(selector);
+            if (owner) matches.add(owner);
+        }
+        matches.forEach(callback);
+    }
+
+    function updateContent(scope) {
+        prepareSearchCards(scope);
+        hideSelectionToolbar(scope);
+        prepareAnswerCards(scope);
+        prepareComments(scope);
+        forEachWithin(scope, '.TopstoryItem', card => {
+            const title = card.querySelector('.ContentItem-title a[href]');
+            let article = !!card.querySelector('.ContentItem.ArticleItem');
+            if (title) {
+                const url = new URL(title.href, location.href);
+                article ||= url.hostname === 'zhuanlan.zhihu.com' && /^\/p\//.test(url.pathname);
+            }
+            card.toggleAttribute('data-zb-article', article);
+        });
+        forEachWithin(scope, '.AnswerItem > div[tabindex="0"]', el => {
+            if (el.textContent.includes('更多评论') && el.querySelector('a[href*="/people/"]')) el.setAttribute('data-zb-hot-comment', '');
+        });
+    }
+
     // 用语义节点识别布局，不依赖每次构建都可能改变的 css-* 类名。
     function updateLeanLayout() {
         const root = document.documentElement;
         prepareSearchLayout();
-        hideSelectionToolbar();
-        prepareAnswerCards();
-        prepareComments();
         const heading = document.querySelector('.QuestionPage h1');
         if (heading) {
             const panel = heading.parentElement;
@@ -537,15 +622,6 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         root.toggleAttribute('data-zb-lean', !!document.querySelector('header.LeanAppHeaderBar'));
         root.toggleAttribute('data-zb-hide-left', !menu_value('menu_showLeftNav'));
         root.toggleAttribute('data-zb-hide-articles', isHome() && !!menu_value('menu_hideArticles'));
-        document.querySelectorAll('.TopstoryItem').forEach(card => {
-            const title = card.querySelector('.ContentItem-title a[href]');
-            let article = !!card.querySelector('.ContentItem.ArticleItem');
-            if (title) {
-                const url = new URL(title.href, location.href);
-                article ||= url.hostname === 'zhuanlan.zhihu.com' && /^\/p\//.test(url.pathname);
-            }
-            card.toggleAttribute('data-zb-article', article);
-        });
         document.querySelectorAll('aside').forEach(el => {
             if ([...el.querySelectorAll('nav a')].some(a => new URL(a.href, location.href).pathname === '/')) el.setAttribute('data-zb-leftnav', '');
         });
@@ -561,9 +637,6 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
                     el.setAttribute('data-zb-sidebar', '');
                 }
             });
-        });
-        document.querySelectorAll('.AnswerItem > div[tabindex="0"]').forEach(el => {
-            if (el.textContent.includes('更多评论') && el.querySelector('a[href*="/people/"]')) el.setAttribute('data-zb-hot-comment', '');
         });
         if (!isWideLayout() || !root.hasAttribute('data-zb-lean')) return;
         const main = document.querySelector('main.App-main');
@@ -614,20 +687,21 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
                 sidebar.setAttribute('data-zb-search-sidebar', '');
             });
         }
-        const lists = column.querySelectorAll('[data-za-detail-view-path-module="SearchResultList"]');
-        lists.forEach(list => {
-            // AI 总结有独立的列表项容器。按标题识别，避免隐藏普通结果中提到 AI 的正文。
-            [...list.children].forEach(item => {
-                if (item.matches('.Card,.SearchResult-Card') || item.querySelector('.ContentItem,.SearchResult-Card')) return;
-                const summary = [...item.querySelectorAll('div,span,a')].some(el =>
-                    !el.childElementCount && /^AI\s*智能总结$/.test(el.textContent.trim()));
-                if (summary) item.setAttribute('data-zb-search-ai', '');
-            });
+    }
+
+    function prepareSearchCards(scope) {
+        if (location.pathname !== '/search') return;
+        // AI 总结有独立的列表项容器，不扫描普通搜索结果的正文。
+        forEachWithin(scope, '.SearchMain [data-za-detail-view-path-module="SearchResultList"] > *', item => {
+            if (item.matches('.Card,.SearchResult-Card') || item.querySelector('.ContentItem,.SearchResult-Card')) return;
+            const summary = [...item.querySelectorAll('div,span,a')].some(el =>
+                !el.childElementCount && /^AI\s*智能总结$/.test(el.textContent.trim()));
+            if (summary) item.setAttribute('data-zb-search-ai', '');
         });
         // 仅修饰最外层卡片，专业聚合卡内部的嵌套结果不重复加边框和留白。
-        column.querySelectorAll('.Card').forEach(card => {
+        forEachWithin(scope, '.SearchMain .Card', card => {
             const nested = card.parentElement?.closest('.Card');
-            if (nested && column.contains(nested)) {
+            if (nested?.closest('.SearchMain')) {
                 card.removeAttribute('data-zb-search-card');
                 card.removeAttribute('data-zb-search-special');
                 return;
@@ -651,9 +725,9 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         });
     }
 
-    function hideSelectionToolbar() {
+    function hideSelectionToolbar(scope = document) {
         // 只识别带复制、喜欢、评论和 AI 解释的划词工具条，不拦截文字选择。
-        document.querySelectorAll('svg.ZDI--Repeat24').forEach(icon => {
+        forEachWithin(scope, 'svg.ZDI--Repeat24', icon => {
             let target = null;
             for (let el = icon.parentElement, depth = 0; el && depth < 6; el = el.parentElement, depth++) {
                 const text = el.textContent.replace(/\s/g, '');
@@ -664,39 +738,99 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         });
     }
 
-    function prepareAnswerCards() {
-        document.querySelectorAll('.Question-mainColumn .AnswerItem').forEach(answer => {
+    function prepareAnswerCards(scope) {
+        forEachWithin(scope, '.Question-mainColumn .AnswerItem', answer => {
             const card = answer.closest('.List-item') || answer.closest('.AnswerCard') || answer;
             card.setAttribute('data-zb-answer-card', '');
             for (let el = card.parentElement; el && !el.matches('.Question-mainColumn'); el = el.parentElement) {
                 el.setAttribute('data-zb-answer-list', '');
             }
-            prepareAnswerFold(answer);
+            queueAnswerFold(answer);
         });
     }
 
-    function prepareComments() {
-        document.querySelectorAll('.Comments-container .CommentContent').forEach(content => {
+    function prepareComments(scope) {
+        prepareComments.lists ||= new WeakSet();
+        const checkedLists = new Map();
+        const groupsByList = new Map();
+        forEachWithin(scope, '.Comments-container .CommentContent', content => {
             const body = content.parentElement;
             const row = body.parentElement;
             body.setAttribute('data-zb-comment-body', '');
             row.setAttribute('data-zb-comment-row', '');
             if (body.firstElementChild !== content) body.firstElementChild.setAttribute('data-zb-comment-author', '');
             if (body.lastElementChild !== content) body.lastElementChild.setAttribute('data-zb-comment-meta', '');
-            let list = null;
+            let group = row;
+            let outerList = null, outerGroup = null;
             for (let el = row.parentElement; el && !el.matches('.Comments-container'); el = el.parentElement) {
-                const children = [...el.children].filter(child => child.querySelector('.CommentContent') || child.textContent.trim());
-                if (children.length > 1 && children.every(child => child.querySelector('.CommentContent'))) list = el;
+                if (!checkedLists.has(el)) {
+                    if (prepareComments.lists.has(el)) checkedLists.set(el, true);
+                    else {
+                        const children = [...el.children].filter(child => child.querySelector('.CommentContent') || child.textContent.trim());
+                        checkedLists.set(el, children.length > 1 && children.every(child => child.querySelector('.CommentContent')));
+                    }
+                }
+                if (checkedLists.get(el)) { outerList = el; outerGroup = group; }
+                group = el;
             }
-            if (list) [...list.children].filter(group => group.querySelector('.CommentContent')).forEach(group => group.setAttribute('data-zb-comment-group', ''));
+            if (outerList) {
+                if (!groupsByList.has(outerList)) groupsByList.set(outerList, new Set());
+                groupsByList.get(outerList).add(outerGroup);
+            }
         });
+        // 同一评论列表只识别一次，新增评论只标记对应分组，避免逐条反复扫描整列。
+        groupsByList.forEach((groups, list) => {
+            if (!prepareComments.lists.has(list)) {
+                prepareComments.lists.add(list);
+                groups = new Set([...list.children].filter(child => child.querySelector('.CommentContent')));
+            }
+            groups.forEach(group => group.setAttribute('data-zb-comment-group', ''));
+        });
+    }
+
+    function queueAnswerFold(answer) {
+        queueAnswerFold.pending ||= new Set();
+        queueAnswerFold.pending.add(answer);
+        if (!queueAnswerFold.frame) queueAnswerFold.frame = requestAnimationFrame(flushAnswerFolds);
+    }
+
+    function flushAnswerFolds() {
+        queueAnswerFold.frame = 0;
+        const pending = queueAnswerFold.pending;
+        const started = performance.now();
+        let processed = 0;
+        for (const answer of pending) {
+            pending.delete(answer);
+            if (!answer.isConnected || !answer.closest('.Question-mainColumn')) continue;
+            prepareAnswerFold(answer);
+            // 回答很多时分帧处理，给滚动和知乎自身的渲染留出时间。
+            if (++processed >= 4 || performance.now() - started >= 6) break;
+        }
+        if (pending.size) queueAnswerFold.frame = requestAnimationFrame(flushAnswerFolds);
+    }
+
+    function releaseAnswerFolds(node) {
+        if (node.nodeType !== 1 || node.isConnected || !prepareAnswerFold.observed) return;
+        const inners = [...node.querySelectorAll('.RichContent-inner')];
+        if (node.matches('.RichContent-inner')) inners.push(node);
+        for (const inner of inners) {
+            prepareAnswerFold.observer.unobserve(inner);
+            prepareAnswerFold.observed.delete(inner);
+            prepareAnswerFold.sizes?.delete(inner);
+        }
     }
 
     function prepareAnswerFold(answer) {
         const inner = answer.querySelector('.RichContent-inner');
         const rich = inner?.closest('.RichContent');
         if (!inner || !rich || rich.classList.contains('is-collapsed') || inner.isContentEditable) return;
+        prepareAnswerFold.buttons ||= new WeakMap();
         let button = rich.querySelector(':scope > .zb-answer-toggle');
+        // React 替换正文后同步替换按钮，避免闭包仍操作已经移除的旧正文。
+        if (button && prepareAnswerFold.buttons.get(button) !== inner) {
+            button.remove();
+            button = null;
+        }
         // 使用正文实际高度判断，图片加载后再检查；不重复创建展开按钮。
         if (!button && inner.scrollHeight > 720) {
             if (!inner.id) {
@@ -710,6 +844,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             button.textContent = '展开完整回答';
             button.setAttribute('aria-controls', inner.id);
             button.setAttribute('aria-expanded', 'false');
+            prepareAnswerFold.buttons.set(button, inner);
             const actions = rich.querySelector(':scope > .ContentItem-actions');
             rich.insertBefore(button, actions);
             button.addEventListener('click', () => {
@@ -725,7 +860,17 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         }
         prepareAnswerFold.observed ||= new WeakSet();
         if (!prepareAnswerFold.observed.has(inner)) {
-            prepareAnswerFold.observer ||= new ResizeObserver(() => scheduleUpdate());
+            prepareAnswerFold.sizes ||= new WeakMap();
+            prepareAnswerFold.observer ||= new ResizeObserver(entries => {
+                for (const entry of entries) {
+                    const {width, height} = entry.contentRect;
+                    const previous = prepareAnswerFold.sizes.get(entry.target);
+                    if (previous?.width === width && previous?.height === height) continue;
+                    prepareAnswerFold.sizes.set(entry.target, {width, height});
+                    const owner = entry.target.closest('.Question-mainColumn .AnswerItem');
+                    if (owner) queueAnswerFold(owner);
+                }
+            });
             prepareAnswerFold.observer.observe(inner);
             prepareAnswerFold.observed.add(inner);
         }
@@ -746,25 +891,36 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         if (!inner.hasAttribute('data-zb-folded')) return;
         const limit = inner.getBoundingClientRect().bottom;
         const saved = new Map();
-        const remember = (el, name, value) => {
+        const hidden = new Set();
+        const remember = (el, name) => {
             if (!saved.has(el)) saved.set(el, {});
             const attributes = saved.get(el);
             if (!(name in attributes)) attributes[name] = el.getAttribute(name);
-            el.setAttribute(name, value);
         };
         const visit = el => {
             const rect = el.getBoundingClientRect();
             if (!rect.width && !rect.height) return;
             if (rect.top >= limit - 1) {
-                remember(el, 'inert', '');
-                remember(el, 'aria-hidden', 'true');
+                hidden.add(el);
+                remember(el, 'inert');
+                remember(el, 'aria-hidden');
                 return;
             }
             if (rect.bottom > limit) [...el.children].forEach(visit);
         };
         [...inner.children].forEach(visit);
         inner.querySelectorAll('a[href],button,input,select,textarea,[tabindex],[contenteditable=true]').forEach(el => {
-            if (el.getBoundingClientRect().bottom > limit && !el.closest('[inert]')) remember(el, 'tabindex', '-1');
+            if (el.closest('[inert]')) return;
+            for (let parent = el; parent && parent !== inner; parent = parent.parentElement) {
+                if (hidden.has(parent)) return;
+            }
+            if (el.getBoundingClientRect().bottom > limit) remember(el, 'tabindex');
+        });
+        // 位置全部读取完再写入属性，避免逐节点读写交错造成强制布局。
+        saved.forEach((attributes, el) => {
+            for (const name of Object.keys(attributes)) {
+                el.setAttribute(name, name === 'aria-hidden' ? 'true' : name === 'tabindex' ? '-1' : '');
+            }
         });
         syncAnswerFoldAccess.saved.set(inner, saved);
         if (!syncAnswerFoldAccess.listened) syncAnswerFoldAccess.listened = new WeakSet();
@@ -1040,9 +1196,9 @@ html[data-zb-header-hidden] [data-zb-header-host]:not(:focus-within):not(:hover)
                 pending = false;
                 const current = window.scrollY, delta = current - previous;
                 if (!menu_value('menu_hideTitle') || current < 80 || delta < -4) {
-                    document.documentElement.removeAttribute('data-zb-header-hidden');
+                    document.documentElement.toggleAttribute('data-zb-header-hidden', false);
                 } else if (delta > 4 && !document.activeElement?.closest('header')) {
-                    document.documentElement.setAttribute('data-zb-header-hidden', '');
+                    document.documentElement.toggleAttribute('data-zb-header-hidden', true);
                 }
                 if (Math.abs(delta) > 4 || current < 80) previous = current;
             });
