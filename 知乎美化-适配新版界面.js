@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.1.11
+// @version      0.1.12
 // @author       sven
 // @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、醒目标记盐选和付费回答、稳定的长回答预览及开关、回答列表下拉加载修复、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
@@ -48,39 +48,56 @@
     if (window.onurlchange === undefined) {addUrlChangeEvent();} // Tampermonkey v4.11 版本添加的 onurlchange 事件 grant，可以监控 pjax 等网页的 URL 变化
     // 样式只在设置或路由改变时重建；异步内容仅处理新增/改变的子树。
     let updateTimer = 0;
-    let layoutDirty = false, pageDirty = false, selectionFrame = 0;
+    let layoutDirty = false, pageDirty = false;
     const changedRoots = new Set();
     let answerLoadTimer = 0, answerLoadAttempts = 0;
     const layoutObserver = new MutationObserver(records => {
         let answerListChanged = false;
+        const foldRoots = new Set();
         for (const record of records) {
             const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
             if (!target || target.closest('style,script,.zb-answer-toggle,.zb-paid-badge')) continue;
+            if (record.type === 'attributes') {
+                // 只关心正文内影响布局或键盘访问的属性，不处理全页动画和计数变化。
+                const inner = target.closest('.RichContent-inner');
+                const rich = target.matches('.RichContent') ? target : null;
+                if (!inner && !rich) continue;
+                if (record.attributeName === 'tabindex' && target.getAttribute('tabindex') === '-1') continue;
+                if (inner) invalidateAnswerFold(inner);
+                else rich.querySelectorAll('.RichContent-inner').forEach(invalidateAnswerFold);
+                foldRoots.add(target);
+                continue;
+            }
             if ((record.addedNodes.length || record.removedNodes.length) &&
                 [...record.addedNodes, ...record.removedNodes].every(node => node.nodeType === 1 && node.matches('.zb-paid-badge'))) continue;
             if (record.addedNodes.length && !record.removedNodes.length &&
                 [...record.addedNodes].every(node => node.nodeType === 1 && node.matches('style,script,.zb-answer-toggle'))) continue;
             if (target.closest('.QuestionAnswers-answers')) answerListChanged = true;
+            const inner = target.closest('.RichContent-inner');
+            if (inner) invalidateAnswerFold(inner);
             for (const node of record.removedNodes) releaseAnswerFolds(node);
             for (const node of record.addedNodes) {
                 const element = node.nodeType === 1 ? node : node.parentElement;
                 if (element && !element.matches('style,script,.zb-answer-toggle,.zb-paid-badge')) {
                     changedRoots.add(element);
                     // CSS 已限制初始高度，展开按钮在下一帧补齐，不必等待其余美化任务。
-                    if (document.documentElement.hasAttribute('data-zb-auto-fold')) {
-                        forEachWithin(element, '.Question-mainColumn .AnswerItem', queueAnswerFold);
-                    }
+                    if (!element.closest('.Comments-container,.CommentContent,.ContentItem-actions')) foldRoots.add(element);
                 }
             }
             // 正文替换、原生展开和评论更新也可能发生在已有卡片内部。
             if (!record.addedNodes.length && target.closest('.AnswerItem,.TopstoryItem,.Comments-container,.SearchMain')) changedRoots.add(target);
+            if (inner) foldRoots.add(inner);
             if (!target.closest('.Question-mainColumn,.Topstory-mainColumn,.SearchMain,.Comments-container')) layoutDirty = true;
         }
+        if (foldRoots.size) forEachWithin([...foldRoots], '.Question-mainColumn .AnswerItem', queueAnswerFold);
         // 慢请求的加载占位移除后，也要重新启用空批次补检查。
         if (answerListChanged) scheduleAnswerLoadCheck();
         if (changedRoots.size || layoutDirty) scheduleUpdate();
     });
-    layoutObserver.observe(document.documentElement, {childList: true, subtree: true, characterData: true});
+    layoutObserver.observe(document.documentElement, {
+        childList: true, subtree: true, characterData: true, attributes: true,
+        attributeFilter: ['class', 'style', 'hidden', 'open', 'href', 'disabled', 'tabindex', 'contenteditable', 'width', 'height', 'src']
+    });
     // 知乎异步挂载时可能重置主题，只同步根节点，无需重扫回答或重建样式。
     const themeObserver = new MutationObserver(() => {
         const theme = menu_value('menu_darkMode') && menu_value('menu_darkModeType') === 1 ? 'dark' : 'light';
@@ -102,13 +119,7 @@
             !event.target.closest?.('input,textarea,select,[contenteditable=true]')) resumeAnswerLoading();
     });
     document.addEventListener('visibilitychange', scheduleAnswerLoadCheck);
-    document.addEventListener('selectionchange', () => {
-        if (selectionFrame) return;
-        selectionFrame = requestAnimationFrame(() => {
-            selectionFrame = 0;
-            hideSelectionToolbar();
-        });
-    });
+    // 划词工具条由初始扫描、新增子树及文本变化识别，拖选时无需每帧查询整页。
     // 用户主动点击知乎的阅读全文后保持展开，避免立即被摘要预览重新收起。
     document.addEventListener('click', event => {
         const more = event.target.closest?.('.ContentItem-more');
@@ -123,7 +134,11 @@
     document.addEventListener('load', event => {
         if (event.target.tagName !== 'IMG') return;
         const answer = event.target.closest('.Question-mainColumn .AnswerItem');
-        if (answer) queueAnswerFold(answer);
+        if (answer) {
+            const inner = event.target.closest('.RichContent-inner');
+            if (inner) invalidateAnswerFold(inner);
+            queueAnswerFold(answer);
+        }
     }, true);
     function scheduleUpdate() {
         if (updateTimer) return;
@@ -140,14 +155,16 @@
             if (refreshLayout) updateLeanLayout();
             // 同批次父子节点只处理一次，避免重复遍历嵌套子树。
             const rootSet = new Set(roots);
+            const scopes = [];
             for (const root of roots) {
                 if (!root.isConnected) continue;
                 let covered = false;
                 for (let parent = root.parentElement; parent; parent = parent.parentElement) {
                     if (rootSet.has(parent)) { covered = true; break; }
                 }
-                if (!covered) updateContent(root);
+                if (!covered) scopes.push(root);
             }
+            if (scopes.length) updateContent(scopes);
         }, 120);
     }
     function schedulePageUpdate() {
@@ -276,6 +293,8 @@
 
     // 添加样式
     function addStyle() {
+        // 主题、宽度、路由和设置变化可能改变正文布局，即使外层尺寸相同也需复查。
+        syncAnswerFoldAccess.cache = new WeakMap();
         const width = Number(GM_getValue('menu_widescreenDisplayWidth'));
         if (!Number.isFinite(width) || width < 640 || width > 2400) GM_setValue('menu_widescreenDisplayWidth', '1440');
         updateLeanLayout();
@@ -602,22 +621,30 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
 
     // 包含子树本身和所属卡片，兼容先创建空壳、随后填充正文的异步渲染。
     function forEachWithin(scope, selector, callback) {
-        const matches = new Set(scope.querySelectorAll(selector));
-        if (scope.nodeType === 1) {
-            const owner = scope.closest(selector);
-            if (owner) matches.add(owner);
+        const matches = new Set();
+        for (const root of Array.isArray(scope) ? scope : [scope]) {
+            root.querySelectorAll(selector).forEach(el => matches.add(el));
+            if (root.nodeType === 1) {
+                const owner = root.closest(selector);
+                if (owner) matches.add(owner);
+            }
         }
         matches.forEach(callback);
     }
 
     function updateContent(scope) {
-        prepareSearchCards(scope);
+        const scopes = Array.isArray(scope) ? scope : [scope];
+        // 评论和操作栏更新不影响回答正文，避免把每次评论插入提升为全文处理。
+        const cards = scopes.filter(root => !root.closest?.('.Comments-container,.CommentContent,.ContentItem-actions'));
+        prepareSearchCards(cards);
         hideSelectionToolbar(scope);
-        preparePaidAnswerLabels(scope);
-        prepareAnswerCards(scope);
+        if (cards.length) {
+            preparePaidAnswerLabels(cards);
+            prepareAnswerCards(cards);
+        }
         prepareComments(scope);
         scheduleAnswerLoadCheck();
-        forEachWithin(scope, '.TopstoryItem', card => {
+        forEachWithin(cards, '.TopstoryItem', card => {
             const title = card.querySelector('.ContentItem-title a[href]');
             let article = !!card.querySelector('.ContentItem.ArticleItem');
             if (title) {
@@ -626,7 +653,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             }
             card.toggleAttribute('data-zb-article', article);
         });
-        forEachWithin(scope, '.AnswerItem > div[tabindex="0"]', el => {
+        forEachWithin(cards, '.AnswerItem > div[tabindex="0"]', el => {
             if (el.textContent.includes('更多评论') && el.querySelector('a[href*="/people/"]')) el.setAttribute('data-zb-hot-comment', '');
         });
     }
@@ -860,16 +887,16 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
                 if (text.length > 80) break;
                 if (text.includes('复制') && text.includes('喜欢') && text.includes('评论') && text.includes('AI解释')) target = el;
             }
-            if (target) target.setAttribute('data-zb-selection-toolbar', '');
+            if (target && !target.hasAttribute('data-zb-selection-toolbar')) target.setAttribute('data-zb-selection-toolbar', '');
         });
     }
 
     function prepareAnswerCards(scope) {
         forEachWithin(scope, '.Question-mainColumn .AnswerItem', answer => {
             const card = answer.closest('.List-item') || answer.closest('.AnswerCard') || answer;
-            card.setAttribute('data-zb-answer-card', '');
+            if (!card.hasAttribute('data-zb-answer-card')) card.setAttribute('data-zb-answer-card', '');
             for (let el = card.parentElement; el && !el.matches('.Question-mainColumn'); el = el.parentElement) {
-                el.setAttribute('data-zb-answer-list', '');
+                if (!el.hasAttribute('data-zb-answer-list')) el.setAttribute('data-zb-answer-list', '');
             }
             queueAnswerFold(answer);
         });
@@ -920,6 +947,10 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         if (!queueAnswerFold.frame) queueAnswerFold.frame = requestAnimationFrame(flushAnswerFolds);
     }
 
+    function invalidateAnswerFold(inner) {
+        syncAnswerFoldAccess.cache?.delete(inner);
+    }
+
     function flushAnswerFolds() {
         queueAnswerFold.frame = 0;
         const pending = queueAnswerFold.pending;
@@ -940,6 +971,9 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         const inners = [...node.querySelectorAll('.RichContent-inner')];
         if (node.matches('.RichContent-inner')) inners.push(node);
         for (const inner of inners) {
+            inner.removeAttribute('data-zb-folded');
+            syncAnswerFoldAccess(inner);
+            invalidateAnswerFold(inner);
             prepareAnswerFold.observer.unobserve(inner);
             prepareAnswerFold.observed.delete(inner);
             prepareAnswerFold.sizes?.delete(inner);
@@ -961,7 +995,11 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             prepareAnswerFold.sizes?.delete(inner);
             return;
         }
-        if (rich.classList.contains('is-collapsed')) return;
+        if (rich.classList.contains('is-collapsed')) {
+            inner.removeAttribute('data-zb-folded');
+            syncAnswerFoldAccess(inner);
+            return;
+        }
         // React 替换正文后同步替换按钮，避免闭包仍操作已经移除的旧正文。
         if (button && prepareAnswerFold.buttons.get(button) !== inner) {
             button.remove();
@@ -969,6 +1007,12 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         }
         // CSS 在首帧就限制预览高度；JS 只判断溢出并补充控制按钮，不再先铺全文再裁短。
         const previewHeight = parseFloat(getComputedStyle(inner).getPropertyValue('--zb-preview-height')) || 560;
+        if (button && inner.scrollHeight <= previewHeight + 1) {
+            button.remove();
+            button = null;
+            inner.removeAttribute('data-zb-folded');
+            syncAnswerFoldAccess(inner);
+        }
         if (!button && inner.scrollHeight > previewHeight + 1) {
             if (!inner.id) {
                 prepareAnswerFold.nextId = (prepareAnswerFold.nextId || 0) + 1;
@@ -1006,6 +1050,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
                     const previous = prepareAnswerFold.sizes.get(entry.target);
                     if (previous?.width === width && previous?.height === height) continue;
                     prepareAnswerFold.sizes.set(entry.target, {width, height});
+                    if (previous) invalidateAnswerFold(entry.target);
                     const owner = entry.target.closest('.Question-mainColumn .AnswerItem');
                     if (owner) queueAnswerFold(owner);
                 }
@@ -1016,7 +1061,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         if (button) {
             const expanded = inner.hasAttribute('data-zb-expanded');
             inner.toggleAttribute('data-zb-folded', !expanded);
-            button.setAttribute('aria-expanded', String(expanded));
+            if (button.getAttribute('aria-expanded') !== String(expanded)) button.setAttribute('aria-expanded', String(expanded));
             const text = expanded ? '收起回答' : '展开完整回答';
             if (button.textContent !== text) button.textContent = text;
             syncAnswerFoldAccess(inner);
@@ -1026,22 +1071,32 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     // 仅让裁切线下的节点退出辅助阅读和 Tab 顺序，保留可见摘要中的链接。
     function syncAnswerFoldAccess(inner) {
         syncAnswerFoldAccess.saved ||= new WeakMap();
+        syncAnswerFoldAccess.cache ||= new WeakMap();
         const previous = syncAnswerFoldAccess.saved.get(inner);
-        previous?.forEach((attributes, el) => {
-            for (const [name, value] of Object.entries(attributes)) {
-                if (value === null) el.removeAttribute(name);
-                else el.setAttribute(name, value);
-            }
-        });
-        syncAnswerFoldAccess.saved.delete(inner);
-        if (!inner.hasAttribute('data-zb-folded')) return;
+        const imposedValue = name => name === 'aria-hidden' ? 'true' : name === 'tabindex' ? '-1' : '';
+        const restore = (el, name, value) => {
+            // 网站在折叠期间主动修改过的属性保留给网站处理。
+            if (el.getAttribute(name) !== imposedValue(name)) return;
+            if (value === null) el.removeAttribute(name);
+            else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+        };
+        if (!inner.hasAttribute('data-zb-folded')) {
+            previous?.forEach((attributes, el) => {
+                for (const [name, value] of Object.entries(attributes)) restore(el, name, value);
+            });
+            syncAnswerFoldAccess.saved.delete(inner);
+            syncAnswerFoldAccess.cache.delete(inner);
+            return;
+        }
+        const size = {width: inner.clientWidth, height: inner.clientHeight, naturalHeight: inner.scrollHeight};
+        const cached = syncAnswerFoldAccess.cache.get(inner);
+        if (cached && cached.width === size.width && cached.height === size.height && cached.naturalHeight === size.naturalHeight) return;
         const limit = inner.getBoundingClientRect().bottom;
-        const saved = new Map();
+        const desired = new Map();
         const hidden = new Set();
         const remember = (el, name) => {
-            if (!saved.has(el)) saved.set(el, {});
-            const attributes = saved.get(el);
-            if (!(name in attributes)) attributes[name] = el.getAttribute(name);
+            if (!desired.has(el)) desired.set(el, new Set());
+            desired.get(el).add(name);
         };
         const visit = el => {
             const rect = el.getBoundingClientRect();
@@ -1056,19 +1111,32 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         };
         [...inner.children].forEach(visit);
         inner.querySelectorAll('a[href],button,input,select,textarea,[tabindex],[contenteditable=true]').forEach(el => {
-            if (el.closest('[inert]')) return;
             for (let parent = el; parent && parent !== inner; parent = parent.parentElement) {
                 if (hidden.has(parent)) return;
+                // 旧的脚本 inert 可能因尺寸变化而解除，只有网站原有的 inert 才直接跳过。
+                if (parent.hasAttribute('inert') && previous?.get(parent)?.inert !== null) return;
             }
             if (el.getBoundingClientRect().bottom > limit) remember(el, 'tabindex');
         });
-        // 位置全部读取完再写入属性，避免逐节点读写交错造成强制布局。
-        saved.forEach((attributes, el) => {
-            for (const name of Object.keys(attributes)) {
-                el.setAttribute(name, name === 'aria-hidden' ? 'true' : name === 'tabindex' ? '-1' : '');
+        // 所有位置读取结束后，只恢复和写入发生变化的属性，避免选字时反复改动整篇正文。
+        previous?.forEach((attributes, el) => {
+            for (const [name, value] of Object.entries(attributes)) {
+                if (!desired.get(el)?.has(name)) restore(el, name, value);
             }
         });
+        const saved = new Map();
+        desired.forEach((names, el) => {
+            const attributes = {};
+            for (const name of names) {
+                const current = el.getAttribute(name), value = imposedValue(name);
+                const original = previous?.get(el);
+                attributes[name] = original && name in original && current === value ? original[name] : current;
+                if (current !== value) el.setAttribute(name, value);
+            }
+            saved.set(el, attributes);
+        });
         syncAnswerFoldAccess.saved.set(inner, saved);
+        syncAnswerFoldAccess.cache.set(inner, size);
         if (!syncAnswerFoldAccess.listened) syncAnswerFoldAccess.listened = new WeakSet();
         if (!syncAnswerFoldAccess.listened.has(inner)) {
             inner.addEventListener('focusin', event => {
