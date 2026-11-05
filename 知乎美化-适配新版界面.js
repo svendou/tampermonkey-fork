@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.1.3
+// @version      0.1.4
 // @author       sven
-// @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
+// @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章和盐选专栏回答、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
 // @match        *://zhuanlan.zhihu.com/*
 // @exclude      https://www.zhihu.com/signin*
@@ -37,7 +37,8 @@
         ['menu_postimg', '隐藏文章开头大图', '隐藏文章开头大图', true],
         ['menu_hideTitle', '向下翻时自动隐藏顶栏', '向下翻时自动隐藏顶栏', true],
         ['menu_showLeftNav', '显示左侧导航', '显示左侧导航', false],
-        ['menu_hideArticles', '屏蔽首页文章', '屏蔽首页文章', true]
+        ['menu_hideArticles', '屏蔽首页文章', '屏蔽首页文章', true],
+        ['menu_hideSaltAnswers', '屏蔽盐选专栏回答', '屏蔽带盐选专栏介绍或付费阅读组件的回答', true]
     ], menu_ID = [];
     for (let i=0;i<menu_ALL.length;i++){ // 如果读取到的值为 null 就写入默认值
         if (GM_getValue(menu_ALL[i][0]) == null){GM_setValue(menu_ALL[i][0], menu_ALL[i][3])};
@@ -573,6 +574,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     function updateContent(scope) {
         prepareSearchCards(scope);
         hideSelectionToolbar(scope);
+        prepareSaltAnswers(scope);
         prepareAnswerCards(scope);
         prepareComments(scope);
         forEachWithin(scope, '.TopstoryItem', card => {
@@ -586,6 +588,19 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         });
         forEachWithin(scope, '.AnswerItem > div[tabindex="0"]', el => {
             if (el.textContent.includes('更多评论') && el.querySelector('a[href*="/people/"]')) el.setAttribute('data-zb-hot-comment', '');
+        });
+    }
+
+    function prepareSaltAnswers(scope) {
+        forEachWithin(scope, '.AnswerItem', answer => {
+            const card = answer.closest('.TopstoryItem,.SearchResult-Card,.List-item,.AnswerCard') || answer;
+            // 只认盐选回答自己的介绍/付费组件，正文提到盐选或评论区推荐不作为依据。
+            const markers = answer.querySelectorAll('[class*="KfeCollection-IntroCard"],.KfeCollection-PaidAnswerFooter,[class*="ManuscriptIntro-root-"]');
+            const salt = [...markers].some(marker => marker.closest('.AnswerItem') === answer &&
+                !marker.closest('.Comments-container,blockquote'));
+            answer.toggleAttribute('data-zb-salt-answer', salt);
+            // 聚合卡可能包含多个回答，只有独立卡片才连同外层一起隐藏。
+            if (card !== answer) card.toggleAttribute('data-zb-salt-answer', salt && card.querySelectorAll('.AnswerItem').length === 1);
         });
     }
 
@@ -622,6 +637,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         root.toggleAttribute('data-zb-lean', !!document.querySelector('header.LeanAppHeaderBar'));
         root.toggleAttribute('data-zb-hide-left', !menu_value('menu_showLeftNav'));
         root.toggleAttribute('data-zb-hide-articles', isHome() && !!menu_value('menu_hideArticles'));
+        root.toggleAttribute('data-zb-hide-salt', !!menu_value('menu_hideSaltAnswers'));
         document.querySelectorAll('aside').forEach(el => {
             if ([...el.querySelectorAll('nav a')].some(a => new URL(a.href, location.href).pathname === '/')) el.setAttribute('data-zb-leftnav', '');
         });
@@ -789,6 +805,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     }
 
     function queueAnswerFold(answer) {
+        if (menu_value('menu_hideSaltAnswers') && answer.closest('[data-zb-salt-answer]')) return;
         queueAnswerFold.pending ||= new Set();
         queueAnswerFold.pending.add(answer);
         if (!queueAnswerFold.frame) queueAnswerFold.frame = requestAnimationFrame(flushAnswerFolds);
@@ -802,6 +819,7 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         for (const answer of pending) {
             pending.delete(answer);
             if (!answer.isConnected || !answer.closest('.Question-mainColumn')) continue;
+            if (menu_value('menu_hideSaltAnswers') && answer.closest('[data-zb-salt-answer]')) continue;
             prepareAnswerFold(answer);
             // 回答很多时分帧处理，给滚动和知乎自身的渲染留出时间。
             if (++processed >= 4 || performance.now() - started >= 6) break;
@@ -1033,6 +1051,7 @@ html[data-zb-wide-layout][data-zb-lean] [data-zb-shell] {padding-inline: 20px; b
 html[data-zb-wide-layout][data-zb-lean] [data-zb-spacer] {display: none !important;}
 html[data-zb-hide-left] [data-zb-leftnav] {display: none !important;}
 html[data-zb-hide-articles] .TopstoryItem[data-zb-article] {display: none !important;}
+html[data-zb-hide-salt] [data-zb-salt-answer] {display: none !important;}
 html[data-zb-topic][data-zb-wide-layout] [data-zb-topic-sidebar] {display: none !important;}
 html[data-zb-topic][data-zb-wide-layout][data-zb-lean] main > [data-za-detail-view-path-module=TopicItem] {width: 100% !important; max-width: var(--zb-width); margin-inline: auto; padding-inline: 20px; box-sizing: border-box;}
 html[data-zb-topic][data-zb-wide-layout][data-zb-lean] [data-za-detail-view-path-module=TopicItem] > div,
