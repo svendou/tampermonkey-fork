@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页自由复制 · 反调试增强
 // @namespace    local.sven.web-unlock
-// @version      1.0.1
+// @version      1.0.2
 // @description  恢复文字选择、复制和右键；清除复制尾巴；动态 debugger 拦截、控制台探针防护；每站独立开关。
 // @author       sven
 // @license      MIT
@@ -27,7 +27,7 @@
  */
 (() => {
     'use strict';
-    const VERSION = '1.0.1';
+    const VERSION = '1.0.2';
     const STORE = 'web-unlock:sites:v1';
     const HOST = location.hostname;
     const PAGE = typeof unsafeWindow === 'object' ? unsafeWindow : window;
@@ -57,7 +57,8 @@
     let config = load(), temporary = false, menuIds = [], panel = null, savedText = '';
     let observer = null, roots = new Map(), patches = [], antiInstalled = false, antiOptions = '', libraryTimer = 0;
     let pendingRoots = new Set(), flushTimer = 0, noticeTimer = 0, notice = null;
-    let scanJobs = [], cleanupNeeded = false;
+    const scanJobs = createWorkQueue(), mutationBatches = createWorkQueue();
+    let rootBatch = null, cleanupState = null, cleanupNeeded = false;
     const pendingInline = new Set();
     const rootObservers = new Map();
     const changedInline = new Map();
@@ -199,7 +200,7 @@ THE SOFTWARE.
         return `${prefix}${SELECTOR} { -webkit-user-select:text !important; user-select:text !important; -webkit-touch-callout:default !important; }`;
     }
     function addRoot(root) {
-        if (roots.has(root) || root.host?.hasAttribute('data-web-unlock-ui')) return;
+        if (roots.has(root) || (root !== document && !root.host.isConnected) || root.host?.hasAttribute('data-web-unlock-ui')) return false;
         const style = document.createElement('style');
         style.dataset.webUnlockStyle = '';
         style.textContent = cssFor(root);
@@ -211,6 +212,7 @@ THE SOFTWARE.
             rootObservers.set(root, rootObserver);
             rootObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
         }
+        return true;
     }
     function hasInlineRestriction(el) {
         const style = el.style;
@@ -235,28 +237,77 @@ THE SOFTWARE.
         }
     }
     function scheduleFlush(delay = 80) {
-        if (!flushTimer) flushTimer = native.timeout(flush, scanJobs.length ? 16 : delay);
+        if (!flushTimer) flushTimer = native.timeout(flush, scanJobs.size ? 16 : delay);
     }
-    function visit(node) {
+    function visit(node, schedule = true) {
         if (!(node instanceof Element) && !(node instanceof ShadowRoot)) return;
         if (node === panel?.host || node.matches?.('[data-web-unlock-style],[data-web-unlock-ui],script,style')) return;
         pendingRoots.add(node);
-        scheduleFlush();
+        if (schedule) scheduleFlush();
     }
     function scanElement(el) {
         pendingInline.delete(el);
-        if (el.shadowRoot) { addRoot(el.shadowRoot); visit(el.shadowRoot); }
+        // 宿主可能短暂离线后重连，原有扫描任务也可能在离线期间被丢弃。
+        if (el.shadowRoot) { addRoot(el.shadowRoot); visit(el.shadowRoot, false); }
         repairInline(el);
     }
-    function queueScans() {
-        if (!pendingRoots.size) return;
-        const pending = pendingRoots;
-        pendingRoots = new Set();
-        for (const node of pending) {
+    function withinScanBudget(budget) {
+        // 一个新增节点通常经过收集、排队、扫描、完成四步；正文扫描仍限 400 个节点。
+        return budget.steps < 1600 && performance.now() - budget.started < 6;
+    }
+    // 链式 FIFO：完成队头任务时不搬移数组，也不反复跳过已删除的条目。
+    function createWorkQueue() {
+        let head = null, tail = null, size = 0;
+        return {
+            get size() { return size; },
+            get first() { return head?.value; },
+            push(value) {
+                const entry = { value, next: null };
+                if (tail) tail.next = entry;
+                else head = entry;
+                tail = entry; size++;
+            },
+            shift() {
+                if (!head) return;
+                head = head.next;
+                if (!head) tail = null;
+                size--;
+            },
+            clear() { head = tail = null; size = 0; }
+        };
+    }
+    function collectMutations(budget) {
+        let processed = 0;
+        while (mutationBatches.size && processed < 400 && withinScanBudget(budget)) {
+            const batch = mutationBatches.first;
+            const record = batch.records[batch.index];
+            budget.steps++; processed++;
+            if (!batch.addedIndex && record.removedNodes.length) cleanupNeeded = true;
+            const node = record.addedNodes[batch.addedIndex++];
+            if (node instanceof Element) visit(node, false);
+            if (batch.addedIndex >= record.addedNodes.length) {
+                batch.index++;
+                batch.addedIndex = 0;
+            }
+            if (batch.index >= batch.records.length) mutationBatches.shift();
+        }
+    }
+    function queueScans(budget) {
+        let processed = 0;
+        while (processed < 400 && withinScanBudget(budget)) {
+            if (!rootBatch) {
+                if (!pendingRoots.size) return;
+                rootBatch = { roots: pendingRoots, iterator: pendingRoots.values() };
+                pendingRoots = new Set();
+            }
+            const next = rootBatch.iterator.next();
+            budget.steps++; processed++;
+            if (next.done) { rootBatch = null; continue; }
+            const node = next.value;
             if (!node.isConnected) continue;
             let covered = false;
             for (let parent = node.parentNode; parent; parent = parent.parentNode) {
-                if (pending.has(parent)) { covered = true; break; }
+                if (rootBatch.roots.has(parent)) { covered = true; break; }
             }
             if (covered) continue;
             const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT, {
@@ -266,61 +317,94 @@ THE SOFTWARE.
             scanJobs.push({ root: node, walker, first: node instanceof Element ? node : null });
         }
     }
-    function cleanupSelection() {
-        if (!cleanupNeeded) return;
-        cleanupNeeded = false;
-        for (const [el] of changedInline) if (!el.isConnected) changedInline.delete(el);
-        for (const [root, style] of roots) {
-            if (root !== document && !root.host.isConnected) {
-                rootObservers.get(root)?.disconnect();
-                rootObservers.delete(root);
-                style.remove(); roots.delete(root);
-            } else if (!style.isConnected) {
-                (root === document ? document.head || document.documentElement : root).append(style);
+    function restoreInline(el, props) {
+        for (const [name, saved] of props) {
+            if (el.style.getPropertyValue(name) === 'text' && el.style.getPropertyPriority(name) === 'important') {
+                el.style.setProperty(name, saved.value, saved.priority);
+            }
+        }
+    }
+    function cleanupSelection(budget) {
+        let processed = 0;
+        // 有正文等待扫描时为它保留时间；空闲时用完本帧剩余预算。
+        const limit = scanJobs.size ? 200 : 1600;
+        while (processed < limit && withinScanBudget(budget)) {
+            if (!cleanupState) {
+                if (!cleanupNeeded) return;
+                cleanupNeeded = false;
+                // Map 迭代器会包含后续新增条目，限定本轮数量，避免持续新增时清理不结束。
+                cleanupState = {
+                    roots: roots.entries(), rootRemaining: roots.size,
+                    inline: changedInline.entries(), inlineRemaining: changedInline.size
+                };
+            }
+            budget.steps++; processed++;
+            if (cleanupState.roots) {
+                const next = cleanupState.roots.next();
+                if (next.done || cleanupState.rootRemaining-- <= 0) { cleanupState.roots = null; continue; }
+                const [root, style] = next.value;
+                if (root !== document && !root.host.isConnected) {
+                    rootObservers.get(root)?.disconnect();
+                    rootObservers.delete(root);
+                    style.remove(); roots.delete(root);
+                } else if (!style.isConnected) {
+                    (root === document ? document.head || document.documentElement : root).append(style);
+                }
+            } else {
+                const next = cleanupState.inline.next();
+                if (next.done || cleanupState.inlineRemaining-- <= 0) { cleanupState = null; continue; }
+                const [el, props] = next.value;
+                if (!el.isConnected) {
+                    // 虚拟列表可能缓存后重用节点，丢弃记录前先归还原样式。
+                    restoreInline(el, props);
+                    changedInline.delete(el);
+                }
             }
         }
     }
     function flush() {
         flushTimer = 0;
         if (!active() || !config.selection) return;
-        queueScans();
-        const started = performance.now();
-        let scanned = 0, completed = 0;
+        const budget = { started: performance.now(), steps: 0 };
+        collectMutations(budget);
+        queueScans(budget);
+        let repaired = 0;
         for (const el of pendingInline) {
+            if (repaired >= 400 || !withinScanBudget(budget)) break;
             pendingInline.delete(el);
             if (el.isConnected) repairInline(el);
-            if (++scanned >= 400 || performance.now() - started >= 6) break;
+            budget.steps++; repaired++;
         }
-        // 首次打开和大批内容加载都分批扫描，不在单次任务里遍历整页。
-        while (completed < scanJobs.length && scanned < 400 && performance.now() - started < 6) {
-            const job = scanJobs[completed];
-            if (!job.root.isConnected) { completed++; continue; }
+        cleanupSelection(budget);
+        // 收集、排队、扫描和清理共用预算，不把大批工作留在计时范围之外。
+        let scanned = 0;
+        while (scanJobs.size && scanned < 400 && withinScanBudget(budget)) {
+            const job = scanJobs.first;
+            budget.steps++;
+            if (!job.root.isConnected) { scanJobs.shift(); continue; }
             // 分批扫描期间列表可能删除当前节点，从根节点重新接续以免漏掉后续内容。
             if (job.walker.currentNode !== job.root && !job.root.contains(job.walker.currentNode)) {
                 job.walker.currentNode = job.root;
             }
             const el = job.first || job.walker.nextNode();
             job.first = null;
-            if (!el) { completed++; continue; }
+            if (!el) { scanJobs.shift(); continue; }
             scanElement(el);
             scanned++;
         }
-        if (completed) scanJobs.splice(0, completed);
-        cleanupSelection();
-        if (scanJobs.length || pendingRoots.size || pendingInline.size) scheduleFlush(16);
+        if (scanJobs.size || mutationBatches.size || rootBatch || pendingRoots.size || pendingInline.size || cleanupState || cleanupNeeded) scheduleFlush(16);
     }
     function selectionMutations(records) {
+        const children = [];
         for (const record of records) {
             if (record.type === 'attributes') {
-                // 跳过动画样式与脚本自己的修复，避免不断排入无关任务。
+                // 样式动画直接过滤；只保留当前确有限制的元素，并按元素合并，避免旧记录堆积。
                 if (hasInlineRestriction(record.target)) pendingInline.add(record.target);
-            }
-            else {
-                for (const node of record.addedNodes) if (node instanceof Element) visit(node);
-                if (record.removedNodes.length) cleanupNeeded = true;
-            }
+            } else children.push(record);
         }
-        if (cleanupNeeded || pendingInline.size) scheduleFlush();
+        // 保留游标，MutationRecord 内的大批 addedNodes 也分批收集。
+        if (children.length) mutationBatches.push({ records: children, index: 0, addedIndex: 0 });
+        if (children.length || pendingInline.size) scheduleFlush();
     }
     function startSelection() {
         if (!document.documentElement) return;
@@ -333,15 +417,12 @@ THE SOFTWARE.
         for (const rootObserver of rootObservers.values()) rootObserver.disconnect();
         rootObservers.clear(); observer = null;
         native.clearTimeout(flushTimer); flushTimer = 0; pendingRoots.clear();
-        pendingInline.clear(); scanJobs = []; cleanupNeeded = false;
+        pendingInline.clear(); scanJobs.clear(); mutationBatches.clear();
+        rootBatch = cleanupState = null; cleanupNeeded = false;
         document.documentElement?.removeAttribute('data-web-unlock');
         for (const style of roots.values()) style.remove();
         roots.clear();
-        for (const [el, props] of changedInline) for (const [name, saved] of props) {
-            if (el.style.getPropertyValue(name) === 'text' && el.style.getPropertyPriority(name) === 'important') {
-                el.style.setProperty(name, saved.value, saved.priority);
-            }
-        }
+        for (const [el, props] of changedInline) restoreInline(el, props);
         changedInline.clear();
     }
     // Late attachShadow on an existing element does not generate a DOM mutation.
@@ -351,7 +432,7 @@ THE SOFTWARE.
         patch(proto, 'attachShadow', new Proxy(proto.attachShadow, {
             apply(target, self, args) {
                 const root = native.apply(target, self, args);
-                if (active() && config.selection && args[0]?.mode === 'open' && !self.hasAttribute('data-web-unlock-ui')) {
+                if (active() && config.selection && self.isConnected && args[0]?.mode === 'open' && !self.hasAttribute('data-web-unlock-ui')) {
                     addRoot(root); visit(root);
                 }
                 return root;
@@ -479,9 +560,7 @@ THE SOFTWARE.
                 if (n.type === 'BlockStatement') return n.body.every(onlyTrap);
                 if (infiniteLoop(n)) return onlyTrap(n.body);
                 if (n.type === 'ExpressionStatement') return onlyTrap(n.expression);
-                if (n.type === 'CallExpression' && n.callee.type === 'Identifier' && n.callee.name === 'eval' && n.arguments.length === 1 && n.arguments[0].type === 'Literal' && typeof n.arguments[0].value === 'string') {
-                    return parse(n.arguments[0].value).body.every(onlyTrap);
-                }
+                // 函数源码不能证明 eval 的词法绑定；它可能是网站自己的业务函数。
                 return false;
             };
             // Default parameters / destructuring may execute code before the function body.
