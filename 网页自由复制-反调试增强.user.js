@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         网页自由复制 · 反调试增强
 // @namespace    local.sven.web-unlock
-// @version      1.0.0
+// @version      1.0.1
 // @description  恢复文字选择、复制和右键；清除复制尾巴；动态 debugger 拦截、控制台探针防护；每站独立开关。
 // @author       sven
 // @license      MIT
@@ -27,7 +27,7 @@
  */
 (() => {
     'use strict';
-    const VERSION = '1.0.0';
+    const VERSION = '1.0.1';
     const STORE = 'web-unlock:sites:v1';
     const HOST = location.hostname;
     const PAGE = typeof unsafeWindow === 'object' ? unsafeWindow : window;
@@ -42,7 +42,7 @@
         ['copy', '恢复复制，阻止追加尾巴', '保留浏览器原生复制格式；编辑器默认保留自身行为。'],
         ['context', '恢复原生右键菜单', '保护编辑器和播放器；Alt + 右键可临时强制恢复。'],
         ['paste', '恢复输入框粘贴', '可选：拦截普通输入框的剪贴板限制，富文本编辑器不受影响。'],
-        ['strong', '加强文字选择', '仅在仍无法拖选时开启；可能影响网页自定义拖动。'],
+        ['strong', '加强文字选择', '仅在仍无法拖选时开启；会拦截选区变化事件，可能影响划词、批注和网页拖动。'],
         ['antiDebug', '拦截动态 debugger', '支持动态函数、字符串定时器、纯断点回调和已知反调试库。'],
         ['consoleGuard', '控制台探针防护', '保留日志，阻止清屏，过滤带自定义 getter / toString 的探针参数。'],
         ['maskSize', '弱化窗口尺寸检测', '可选：缩小 outer / inner 尺寸差；可能影响少数窗口布局逻辑。']
@@ -55,14 +55,19 @@
         apply: Reflect.apply, construct: Reflect.construct
     };
     let config = load(), temporary = false, menuIds = [], panel = null, savedText = '';
-    let observer = null, roots = new Map(), patches = [], antiInstalled = false, libraryTimer = 0;
+    let observer = null, roots = new Map(), patches = [], antiInstalled = false, antiOptions = '', libraryTimer = 0;
     let pendingRoots = new Set(), flushTimer = 0, noticeTimer = 0, notice = null;
+    let scanJobs = [], cleanupNeeded = false;
+    const pendingInline = new Set();
+    const rootObservers = new Map();
     const changedInline = new Map();
     const suspendedLibraries = new Map();
     let acornParser;
     const cache = new Map();
     let cacheSize = 0;
     const pureCache = new WeakMap();
+    const pureSources = new Map();
+    let pureSourceSize = 0;
 
     function getParser() {
         if (acornParser) return acornParser;
@@ -110,14 +115,17 @@ THE SOFTWARE.
         Object.defineProperty(safe, HOST, { value: { ...config }, enumerable: true, configurable: true, writable: true });
         GM_setValue(STORE, safe);
     }
+    function focusedElement() {
+        let focus = document.activeElement;
+        while (focus?.shadowRoot?.activeElement) focus = focus.shadowRoot.activeElement;
+        return focus;
+    }
     function editable(event, richOnly = false) {
         const selector = richOnly
             ? '[contenteditable]:not([contenteditable="false"]),[role="textbox"],.monaco-editor,.CodeMirror,.cm-editor,.ace_editor'
             : 'input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="textbox"],.monaco-editor,.CodeMirror,.cm-editor,.ace_editor';
         if (event.type === 'selectionchange') {
-            let focus = document.activeElement;
-            while (focus?.shadowRoot?.activeElement) focus = focus.shadowRoot.activeElement;
-            if (focus?.matches(selector)) return true;
+            if (focusedElement()?.closest(selector)) return true;
         }
         return event.composedPath().some(el => el instanceof Element && el.matches(selector));
     }
@@ -127,7 +135,7 @@ THE SOFTWARE.
             el.matches('button,select,option,video,audio,canvas,[role="slider"],[draggable="true"]'));
     }
     function selectionText() {
-        const el = document.activeElement;
+        const el = focusedElement();
         if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
             try { return el.value.slice(el.selectionStart ?? 0, el.selectionEnd ?? 0); } catch { return ''; }
         }
@@ -152,7 +160,12 @@ THE SOFTWARE.
             if (config.paste && !editable(event, true)) event.stopImmediatePropagation();
             return;
         }
-        if (event.type === 'selectstart' || event.type === 'selectionchange') {
+        // 普通模式保留网站同步选区的通知，避免划词/批注组件使用旧选区。
+        if (event.type === 'selectionchange') {
+            if (config.selection && config.strong && !editable(event)) event.stopImmediatePropagation();
+            return;
+        }
+        if (event.type === 'selectstart') {
             if (config.selection && !editable(event)) event.stopImmediatePropagation();
             return;
         }
@@ -180,6 +193,7 @@ THE SOFTWARE.
     }, true);
 
     const SELECTOR = '*:not(input):not(textarea):not(select):not(option):not(button):not(button *):not(video):not(audio):not(canvas):not([contenteditable]):not([contenteditable] *):not([role="textbox"]):not([role="textbox"] *):not(.monaco-editor):not(.monaco-editor *):not(.CodeMirror):not(.CodeMirror *):not(.cm-editor):not(.cm-editor *):not(.ace_editor):not(.ace_editor *)';
+    const SELECT_PROPERTIES = ['user-select', '-webkit-user-select'];
     function cssFor(root) {
         const prefix = root === document ? ':root[data-web-unlock] ' : '';
         return `${prefix}${SELECTOR} { -webkit-user-select:text !important; user-select:text !important; -webkit-touch-callout:default !important; }`;
@@ -191,13 +205,23 @@ THE SOFTWARE.
         style.textContent = cssFor(root);
         roots.set(root, style);
         (root === document ? (document.head || document.documentElement) : root)?.append(style);
-        if (observer) observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+        if (observer) {
+            // 每个 ShadowRoot 独立监听，节点移除后可以及时解除引用。
+            const rootObserver = root === document ? observer : new MutationObserver(selectionMutations);
+            rootObservers.set(root, rootObserver);
+            rootObserver.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] });
+        }
+    }
+    function hasInlineRestriction(el) {
+        const style = el.style;
+        return !!style?.length && SELECT_PROPERTIES.some(name =>
+            style.getPropertyValue(name) === 'none' && style.getPropertyPriority(name) === 'important');
     }
     function repairInline(el) {
-        if (!el.style || !el.matches(SELECTOR)) return;
-        const affected = ['user-select', '-webkit-user-select'].filter(name =>
+        // 大部分节点没有行内选中限制，不必对它们执行复杂的选择器匹配。
+        if (!hasInlineRestriction(el) || !el.matches(SELECTOR)) return;
+        const affected = SELECT_PROPERTIES.filter(name =>
             el.style.getPropertyValue(name) === 'none' && el.style.getPropertyPriority(name) === 'important');
-        if (!affected.length) return;
         if (!changedInline.has(el)) changedInline.set(el, new Map());
         const values = affected.map(name => [name, { value: el.style.getPropertyValue(name), priority: el.style.getPropertyPriority(name) }]);
         for (const [name, value] of values) {
@@ -206,52 +230,110 @@ THE SOFTWARE.
             saved.set(name, value);
         }
         for (const [name] of values) {
-            el.style.setProperty(name, 'text', 'important');
+            // Chromium 中标准属性和 -webkit- 属性可能是同一属性的别名。
+            if (el.style.getPropertyValue(name) !== 'text') el.style.setProperty(name, 'text', 'important');
         }
+    }
+    function scheduleFlush(delay = 80) {
+        if (!flushTimer) flushTimer = native.timeout(flush, scanJobs.length ? 16 : delay);
     }
     function visit(node) {
         if (!(node instanceof Element) && !(node instanceof ShadowRoot)) return;
-        if (node === panel?.host || node.matches?.('[data-web-unlock-style],[data-web-unlock-ui]')) return;
-        const scan = el => { if (el.hasAttribute('data-web-unlock-ui')) return; if (el.shadowRoot) { addRoot(el.shadowRoot); visit(el.shadowRoot); } repairInline(el); };
-        if (node instanceof Element) scan(node);
-        node.querySelectorAll('*').forEach(scan);
+        if (node === panel?.host || node.matches?.('[data-web-unlock-style],[data-web-unlock-ui],script,style')) return;
+        pendingRoots.add(node);
+        scheduleFlush();
+    }
+    function scanElement(el) {
+        pendingInline.delete(el);
+        if (el.shadowRoot) { addRoot(el.shadowRoot); visit(el.shadowRoot); }
+        repairInline(el);
+    }
+    function queueScans() {
+        if (!pendingRoots.size) return;
+        const pending = pendingRoots;
+        pendingRoots = new Set();
+        for (const node of pending) {
+            if (!node.isConnected) continue;
+            let covered = false;
+            for (let parent = node.parentNode; parent; parent = parent.parentNode) {
+                if (pending.has(parent)) { covered = true; break; }
+            }
+            if (covered) continue;
+            const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT, {
+                acceptNode: el => el.matches('[data-web-unlock-style],[data-web-unlock-ui],script,style')
+                    ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+            });
+            scanJobs.push({ root: node, walker, first: node instanceof Element ? node : null });
+        }
+    }
+    function cleanupSelection() {
+        if (!cleanupNeeded) return;
+        cleanupNeeded = false;
+        for (const [el] of changedInline) if (!el.isConnected) changedInline.delete(el);
+        for (const [root, style] of roots) {
+            if (root !== document && !root.host.isConnected) {
+                rootObservers.get(root)?.disconnect();
+                rootObservers.delete(root);
+                style.remove(); roots.delete(root);
+            } else if (!style.isConnected) {
+                (root === document ? document.head || document.documentElement : root).append(style);
+            }
+        }
     }
     function flush() {
         flushTimer = 0;
         if (!active() || !config.selection) return;
-        const pending = [...pendingRoots]; pendingRoots.clear();
-        // When an ancestor is queued, scan its subtree only once.
-        for (const node of pending) {
-            if (!node.isConnected || pending.some(other => other !== node && other.contains?.(node))) continue;
-            visit(node);
+        queueScans();
+        const started = performance.now();
+        let scanned = 0, completed = 0;
+        for (const el of pendingInline) {
+            pendingInline.delete(el);
+            if (el.isConnected) repairInline(el);
+            if (++scanned >= 400 || performance.now() - started >= 6) break;
         }
-        for (const [el] of changedInline) if (!el.isConnected) changedInline.delete(el);
-        for (const [root, style] of roots) if (root !== document && !root.host.isConnected) { style.remove(); roots.delete(root); }
+        // 首次打开和大批内容加载都分批扫描，不在单次任务里遍历整页。
+        while (completed < scanJobs.length && scanned < 400 && performance.now() - started < 6) {
+            const job = scanJobs[completed];
+            if (!job.root.isConnected) { completed++; continue; }
+            // 分批扫描期间列表可能删除当前节点，从根节点重新接续以免漏掉后续内容。
+            if (job.walker.currentNode !== job.root && !job.root.contains(job.walker.currentNode)) {
+                job.walker.currentNode = job.root;
+            }
+            const el = job.first || job.walker.nextNode();
+            job.first = null;
+            if (!el) { completed++; continue; }
+            scanElement(el);
+            scanned++;
+        }
+        if (completed) scanJobs.splice(0, completed);
+        cleanupSelection();
+        if (scanJobs.length || pendingRoots.size || pendingInline.size) scheduleFlush(16);
+    }
+    function selectionMutations(records) {
+        for (const record of records) {
+            if (record.type === 'attributes') {
+                // 跳过动画样式与脚本自己的修复，避免不断排入无关任务。
+                if (hasInlineRestriction(record.target)) pendingInline.add(record.target);
+            }
+            else {
+                for (const node of record.addedNodes) if (node instanceof Element) visit(node);
+                if (record.removedNodes.length) cleanupNeeded = true;
+            }
+        }
+        if (cleanupNeeded || pendingInline.size) scheduleFlush();
     }
     function startSelection() {
         if (!document.documentElement) return;
-        document.documentElement.setAttribute('data-web-unlock', '');
+        document.documentElement.toggleAttribute('data-web-unlock', true);
         if (observer) return;
-        observer = new MutationObserver(records => {
-            let removed = false;
-            for (const record of records) {
-                if (record.type === 'attributes') repairInline(record.target);
-                else record.addedNodes.forEach(node => { if (node instanceof Element) pendingRoots.add(node); });
-                if (record.removedNodes?.length) removed = true;
-                if (record.target instanceof Element && record.target.shadowRoot) pendingRoots.add(record.target);
-            }
-            if (removed) for (const [root, style] of roots) {
-                if (!style.isConnected && (root === document || root.host.isConnected)) {
-                    (root === document ? document.head || document.documentElement : root).append(style);
-                }
-            }
-            if ((removed || pendingRoots.size) && !flushTimer) flushTimer = native.timeout(flush, 80);
-        });
+        observer = new MutationObserver(selectionMutations);
         addRoot(document); visit(document.documentElement);
     }
     function stopSelection() {
-        observer?.disconnect(); observer = null;
+        for (const rootObserver of rootObservers.values()) rootObserver.disconnect();
+        rootObservers.clear(); observer = null;
         native.clearTimeout(flushTimer); flushTimer = 0; pendingRoots.clear();
+        pendingInline.clear(); scanJobs = []; cleanupNeeded = false;
         document.documentElement?.removeAttribute('data-web-unlock');
         for (const style of roots.values()) style.remove();
         roots.clear();
@@ -355,12 +437,17 @@ THE SOFTWARE.
                 }
                 if (node.type === 'DebuggerStatement') ranges.push([node.start - prefix.length, node.end - prefix.length]);
             });
-            ranges.sort((a, b) => b[0] - a[0]);
+            ranges.sort((a, b) => a[0] - b[0]);
+            const chunks = [];
+            let cursor = 0;
             for (const [start, end] of ranges) {
-                if (start < 0 || end > source.length) continue;
+                if (start < cursor || end > source.length) continue;
                 const removed = source.slice(start, end);
-                code = code.slice(0, start) + ';' + removed.slice(1).replace(/[^\r\n]/g, ' ') + code.slice(end);
+                chunks.push(source.slice(cursor, start), ';', removed.slice(1).replace(/[^\r\n]/g, ' '));
+                cursor = end;
             }
+            chunks.push(source.slice(cursor));
+            code = chunks.join('');
         } catch { return source; } // New syntax / invalid source: native behavior is authoritative.
         const weight = key.length + code.length;
         if (weight <= 1000000) {
@@ -379,6 +466,11 @@ THE SOFTWARE.
         try {
             const source = native.apply(native.toString, fn, []);
             if (source.length > 12000 || !source.includes('debugger')) { pureCache.set(fn, false); return false; }
+            if (pureSources.has(source)) {
+                const hit = pureSources.get(source);
+                pureCache.set(fn, hit);
+                return hit;
+            }
             const node = parse(`(${source})`).body[0].expression;
             const onlyTrap = n => {
                 if (!n) return true;
@@ -395,6 +487,12 @@ THE SOFTWARE.
             // Default parameters / destructuring may execute code before the function body.
             pure = ['FunctionExpression', 'ArrowFunctionExpression'].includes(node.type) && !node.generator &&
                 node.params.every(p => p.type === 'Identifier') && onlyTrap(node.body) && found;
+            // 页面反复创建相同回调时复用分析结果，缓存总量有上限。
+            while (pureSources.size >= 64 || pureSourceSize + source.length > 128000) {
+                const oldest = pureSources.keys().next().value;
+                pureSourceSize -= oldest.length; pureSources.delete(oldest);
+            }
+            pureSources.set(source, pure); pureSourceSize += source.length;
         } catch { pure = false; }
         pureCache.set(fn, pure); return pure;
     }
@@ -431,6 +529,7 @@ THE SOFTWARE.
     function installAnti() {
         if (antiInstalled) return;
         antiInstalled = true;
+        antiOptions = `${config.consoleGuard}:${config.maskSize}`;
         const FunctionCtor = PAGE.Function;
         const constructors = [[FunctionCtor, 'function']];
         for (const [expression, kind] of [
@@ -487,6 +586,7 @@ THE SOFTWARE.
         libraryTimer = native.interval(pauseKnownLibrary, 2000);
     }
     function uninstallAnti() {
+        if (!antiInstalled) return;
         native.clearInterval(libraryTimer); libraryTimer = 0;
         restore('anti');
         patches = patches.filter(item => {
@@ -499,13 +599,15 @@ THE SOFTWARE.
         for (const [lib, previous] of suspendedLibraries) {
             try { if (lib.isSuspend === true) lib.isSuspend = previous; } catch { /* Ignore sealed libraries. */ }
         }
-        suspendedLibraries.clear(); antiInstalled = false;
+        suspendedLibraries.clear(); antiInstalled = false; antiOptions = '';
     }
     function apply() {
         if (active() && config.selection) { startSelection(); hookShadow(); }
         else { stopSelection(); restore('shadow'); }
-        uninstallAnti();
-        if (active() && config.antiDebug) installAnti();
+        if (active() && config.antiDebug) {
+            if (antiInstalled && antiOptions !== `${config.consoleGuard}:${config.maskSize}`) uninstallAnti();
+            installAnti();
+        } else uninstallAnti();
         registerMenus();
     }
     function registerMenus() {
@@ -587,6 +689,8 @@ THE SOFTWARE.
         if (remote) { config = load(); temporary = false; apply(); refreshPanel(); }
     });
     document.addEventListener('DOMContentLoaded', () => { if (active() && config.selection) startSelection(); pauseKnownLibrary(); }, { once: true });
-    document.addEventListener('load', pauseKnownLibrary, true);
+    document.addEventListener('load', event => {
+        if (event.target?.tagName === 'SCRIPT') pauseKnownLibrary();
+    }, true);
     apply();
 })();
