@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.1.4
+// @version      0.1.11
 // @author       sven
-// @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章和盐选专栏回答、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
+// @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、醒目标记盐选和付费回答、稳定的长回答预览及开关、回答列表下拉加载修复、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
 // @match        *://zhuanlan.zhihu.com/*
 // @exclude      https://www.zhihu.com/signin*
@@ -38,7 +38,8 @@
         ['menu_hideTitle', '向下翻时自动隐藏顶栏', '向下翻时自动隐藏顶栏', true],
         ['menu_showLeftNav', '显示左侧导航', '显示左侧导航', false],
         ['menu_hideArticles', '屏蔽首页文章', '屏蔽首页文章', true],
-        ['menu_hideSaltAnswers', '屏蔽盐选专栏回答', '屏蔽带盐选专栏介绍或付费阅读组件的回答', true]
+        ['menu_markPaidAnswers', '标记盐选和付费回答', '在标题或作者旁显示醒目的盐选、付费标识', true],
+        ['menu_autoFoldAnswers', '列表自动折叠长回答', '问题列表使用摘要预览；单条回答页保留原生展开行为', true]
     ], menu_ID = [];
     for (let i=0;i<menu_ALL.length;i++){ // 如果读取到的值为 null 就写入默认值
         if (GM_getValue(menu_ALL[i][0]) == null){GM_setValue(menu_ALL[i][0], menu_ALL[i][3])};
@@ -49,21 +50,34 @@
     let updateTimer = 0;
     let layoutDirty = false, pageDirty = false, selectionFrame = 0;
     const changedRoots = new Set();
+    let answerLoadTimer = 0, answerLoadAttempts = 0;
     const layoutObserver = new MutationObserver(records => {
+        let answerListChanged = false;
         for (const record of records) {
             const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
-            if (!target || target.closest('style,script,.zb-answer-toggle')) continue;
+            if (!target || target.closest('style,script,.zb-answer-toggle,.zb-paid-badge')) continue;
+            if ((record.addedNodes.length || record.removedNodes.length) &&
+                [...record.addedNodes, ...record.removedNodes].every(node => node.nodeType === 1 && node.matches('.zb-paid-badge'))) continue;
             if (record.addedNodes.length && !record.removedNodes.length &&
                 [...record.addedNodes].every(node => node.nodeType === 1 && node.matches('style,script,.zb-answer-toggle'))) continue;
+            if (target.closest('.QuestionAnswers-answers')) answerListChanged = true;
             for (const node of record.removedNodes) releaseAnswerFolds(node);
             for (const node of record.addedNodes) {
                 const element = node.nodeType === 1 ? node : node.parentElement;
-                if (element && !element.matches('style,script,.zb-answer-toggle')) changedRoots.add(element);
+                if (element && !element.matches('style,script,.zb-answer-toggle,.zb-paid-badge')) {
+                    changedRoots.add(element);
+                    // CSS 已限制初始高度，展开按钮在下一帧补齐，不必等待其余美化任务。
+                    if (document.documentElement.hasAttribute('data-zb-auto-fold')) {
+                        forEachWithin(element, '.Question-mainColumn .AnswerItem', queueAnswerFold);
+                    }
+                }
             }
             // 正文替换、原生展开和评论更新也可能发生在已有卡片内部。
             if (!record.addedNodes.length && target.closest('.AnswerItem,.TopstoryItem,.Comments-container,.SearchMain')) changedRoots.add(target);
             if (!target.closest('.Question-mainColumn,.Topstory-mainColumn,.SearchMain,.Comments-container')) layoutDirty = true;
         }
+        // 慢请求的加载占位移除后，也要重新启用空批次补检查。
+        if (answerListChanged) scheduleAnswerLoadCheck();
         if (changedRoots.size || layoutDirty) scheduleUpdate();
     });
     layoutObserver.observe(document.documentElement, {childList: true, subtree: true, characterData: true});
@@ -75,6 +89,19 @@
     themeObserver.observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
     window.addEventListener('urlchange', schedulePageUpdate);
     window.addEventListener('popstate', schedulePageUpdate);
+    window.addEventListener('scroll', scheduleAnswerLoadCheck, {passive: true});
+    // 到达底部后滚轮不一定再产生 scroll；只用真实的继续阅读动作补充重试预算。
+    window.addEventListener('wheel', event => {
+        if (event.isTrusted && event.deltaY > 0) resumeAnswerLoading();
+    }, {passive: true});
+    window.addEventListener('touchmove', event => {
+        if (event.isTrusted) resumeAnswerLoading();
+    }, {passive: true});
+    window.addEventListener('keydown', event => {
+        if (event.isTrusted && !event.shiftKey && ['ArrowDown', 'PageDown', 'End', ' '].includes(event.key) &&
+            !event.target.closest?.('input,textarea,select,[contenteditable=true]')) resumeAnswerLoading();
+    });
+    document.addEventListener('visibilitychange', scheduleAnswerLoadCheck);
     document.addEventListener('selectionchange', () => {
         if (selectionFrame) return;
         selectionFrame = requestAnimationFrame(() => {
@@ -82,6 +109,16 @@
             hideSelectionToolbar();
         });
     });
+    // 用户主动点击知乎的阅读全文后保持展开，避免立即被摘要预览重新收起。
+    document.addEventListener('click', event => {
+        const more = event.target.closest?.('.ContentItem-more');
+        const rich = more?.closest('.Question-mainColumn .RichContent.is-collapsed');
+        const inner = rich?.querySelector('.RichContent-inner');
+        if (inner) {
+            inner.setAttribute('data-zb-expanded', '');
+            inner.removeAttribute('data-zb-folded');
+        }
+    }, true);
     // 裁切后的正文高度不一定随图片变化，图片加载只复查所属回答。
     document.addEventListener('load', event => {
         if (event.target.tagName !== 'IMG') return;
@@ -114,6 +151,8 @@
         }, 120);
     }
     function schedulePageUpdate() {
+        window.clearTimeout(answerLoadTimer);
+        answerLoadTimer = answerLoadAttempts = 0;
         pageDirty = true;
         scheduleUpdate();
     }
@@ -574,9 +613,10 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     function updateContent(scope) {
         prepareSearchCards(scope);
         hideSelectionToolbar(scope);
-        prepareSaltAnswers(scope);
+        preparePaidAnswerLabels(scope);
         prepareAnswerCards(scope);
         prepareComments(scope);
+        scheduleAnswerLoadCheck();
         forEachWithin(scope, '.TopstoryItem', card => {
             const title = card.querySelector('.ContentItem-title a[href]');
             let article = !!card.querySelector('.ContentItem.ArticleItem');
@@ -591,17 +631,86 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         });
     }
 
-    function prepareSaltAnswers(scope) {
+    function resumeAnswerLoading() {
+        if (!/^\/question\/\d+(?:\/answers\/updated)?\/?$/.test(location.pathname)) return;
+        answerLoadAttempts = 0;
+        scheduleAnswerLoadCheck();
+    }
+
+    function getIdleAnswerLoader() {
+        if (document.hidden || !/^\/question\/\d+(?:\/answers\/updated)?\/?$/.test(location.pathname)) return null;
+        const list = document.querySelector('.QuestionAnswers-answers [role="list"]');
+        const loader = list?.lastElementChild;
+        // 原生加载中和“没有更多内容”节点都不触发补检查。
+        if (!loader?.matches('div[role="listitem"]') || loader.childElementCount || loader.textContent.trim()) return null;
+        const rect = loader.getBoundingClientRect();
+        return rect.width && rect.top >= 0 && rect.top <= window.innerHeight + 120 ? loader : null;
+    }
+
+    function scheduleAnswerLoadCheck() {
+        if (answerLoadTimer || answerLoadAttempts >= 4 || !getIdleAnswerLoader()) return;
+        const route = location.pathname;
+        answerLoadTimer = window.setTimeout(() => {
+            answerLoadTimer = 0;
+            if (location.pathname !== route || !getIdleAnswerLoader()) return;
+            answerLoadAttempts++;
+            // 连续空批次不会移动页面，滚到底后也不会再产生 scroll。
+            // 通知知乎现有的滚动加载器再检查一次；请求地址、排序和列表节点均交给原站。
+            window.dispatchEvent(new Event('scroll'));
+            // 最多补四次；后续由用户下拉重新启用，避免长时间自动请求。
+            scheduleAnswerLoadCheck();
+        }, 1400);
+    }
+
+    function preparePaidAnswerLabels(scope) {
+        const enabled = !!menu_value('menu_markPaidAnswers');
         forEachWithin(scope, '.AnswerItem', answer => {
-            const card = answer.closest('.TopstoryItem,.SearchResult-Card,.List-item,.AnswerCard') || answer;
-            // 只认盐选回答自己的介绍/付费组件，正文提到盐选或评论区推荐不作为依据。
-            const markers = answer.querySelectorAll('[class*="KfeCollection-IntroCard"],.KfeCollection-PaidAnswerFooter,[class*="ManuscriptIntro-root-"]');
-            const salt = [...markers].some(marker => marker.closest('.AnswerItem') === answer &&
-                !marker.closest('.Comments-container,blockquote'));
-            answer.toggleAttribute('data-zb-salt-answer', salt);
-            // 聚合卡可能包含多个回答，只有独立卡片才连同外层一起隐藏。
-            if (card !== answer) card.toggleAttribute('data-zb-salt-answer', salt && card.querySelectorAll('.AnswerItem').length === 1);
+            const type = enabled ? getPaidAnswerType(answer) : '';
+            const badges = [...answer.querySelectorAll('.zb-paid-badge')].filter(el => el.closest('.AnswerItem') === answer);
+            let badge = badges.shift();
+            badges.forEach(el => el.remove());
+            if (!type) { badge?.remove(); return; }
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'zb-paid-badge';
+            }
+            if (badge.dataset.type !== type) {
+                badge.dataset.type = type;
+                badge.textContent = type === 'salt' ? '盐选' : '付费';
+                badge.title = type === 'salt' ? '盐选内容' : '来自付费专栏';
+            }
+            // 信息流和搜索页放在回答标题旁；回答详情/列表放在作者旁，避免给整个问题误贴标签。
+            const host = [...answer.querySelectorAll('.ContentItem-title,.AuthorInfo-head')]
+                .filter(el => el.closest('.AnswerItem') === answer)
+                .sort((a, b) => Number(b.matches('.ContentItem-title')) - Number(a.matches('.ContentItem-title')))[0];
+            if (host) {
+                if (badge.parentElement !== host) host.appendChild(badge);
+            } else if (badge.parentElement !== answer) answer.prepend(badge);
         });
+    }
+
+    function getPaidAnswerType(answer) {
+        // 只认回答自己的盐选组件或付费专栏标签，正文提及和评论区推荐不作为依据。
+        const markers = answer.querySelectorAll('[class*="KfeCollection-IntroCard"],.KfeCollection-PaidAnswerFooter,[class*="ManuscriptIntro-root-"]');
+        if ([...markers].some(marker => marker.closest('.AnswerItem') === answer &&
+            !marker.closest('.Comments-container,blockquote'))) return 'salt';
+        return hasPaidColumnLabel(answer) ? 'paid' : '';
+    }
+
+    function hasPaidColumnLabel(answer) {
+        // 只遍历回答头部等元信息；整棵跳过正文、评论和作者简介，避免长回答重复扫描。
+        const walker = document.createTreeWalker(answer, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                if (node.nodeType === 1) {
+                    return node.matches('.AnswerItem,.RichContent,.RichText,.Comments-container,.CommentContent,.AuthorInfo,.ContentItem-title,.ContentItem-actions,.zb-paid-badge,blockquote,pre,code')
+                        ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+                }
+                const text = node.nodeValue.replace(/\s/g, '');
+                return /^来自付费专栏(?:[·•・:：]|$)/.test(text)
+                    ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+            }
+        });
+        return !!walker.nextNode();
     }
 
     // 用语义节点识别布局，不依赖每次构建都可能改变的 css-* 类名。
@@ -637,13 +746,14 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         root.toggleAttribute('data-zb-lean', !!document.querySelector('header.LeanAppHeaderBar'));
         root.toggleAttribute('data-zb-hide-left', !menu_value('menu_showLeftNav'));
         root.toggleAttribute('data-zb-hide-articles', isHome() && !!menu_value('menu_hideArticles'));
-        root.toggleAttribute('data-zb-hide-salt', !!menu_value('menu_hideSaltAnswers'));
         document.querySelectorAll('aside').forEach(el => {
             if ([...el.querySelectorAll('nav a')].some(a => new URL(a.href, location.href).pathname === '/')) el.setAttribute('data-zb-leftnav', '');
         });
         root.toggleAttribute('data-zb-home-wide', isHome() && !!menu_value('menu_widescreenDisplayIndex'));
         root.toggleAttribute('data-zb-wide-layout', isWideLayout());
         root.toggleAttribute('data-zb-question', location.pathname.startsWith('/question/'));
+        root.toggleAttribute('data-zb-auto-fold', !!menu_value('menu_autoFoldAnswers') &&
+            /^\/question\/\d+(?:\/answers\/updated)?\/?$/.test(location.pathname));
         root.toggleAttribute('data-zb-topic', location.pathname.startsWith('/topic/'));
         root.style.setProperty('--zb-width', `${GM_getValue('menu_widescreenDisplayWidth')}px`);
         document.querySelectorAll('.Topstory-container').forEach(container => {
@@ -805,7 +915,6 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     }
 
     function queueAnswerFold(answer) {
-        if (menu_value('menu_hideSaltAnswers') && answer.closest('[data-zb-salt-answer]')) return;
         queueAnswerFold.pending ||= new Set();
         queueAnswerFold.pending.add(answer);
         if (!queueAnswerFold.frame) queueAnswerFold.frame = requestAnimationFrame(flushAnswerFolds);
@@ -819,7 +928,6 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
         for (const answer of pending) {
             pending.delete(answer);
             if (!answer.isConnected || !answer.closest('.Question-mainColumn')) continue;
-            if (menu_value('menu_hideSaltAnswers') && answer.closest('[data-zb-salt-answer]')) continue;
             prepareAnswerFold(answer);
             // 回答很多时分帧处理，给滚动和知乎自身的渲染留出时间。
             if (++processed >= 4 || performance.now() - started >= 6) break;
@@ -841,32 +949,45 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     function prepareAnswerFold(answer) {
         const inner = answer.querySelector('.RichContent-inner');
         const rich = inner?.closest('.RichContent');
-        if (!inner || !rich || rich.classList.contains('is-collapsed') || inner.isContentEditable) return;
+        if (!inner || !rich) return;
         prepareAnswerFold.buttons ||= new WeakMap();
         let button = rich.querySelector(':scope > .zb-answer-toggle');
+        if (!document.documentElement.hasAttribute('data-zb-auto-fold') || inner.isContentEditable) {
+            button?.remove();
+            inner.removeAttribute('data-zb-folded');
+            syncAnswerFoldAccess(inner);
+            prepareAnswerFold.observer?.unobserve(inner);
+            prepareAnswerFold.observed?.delete(inner);
+            prepareAnswerFold.sizes?.delete(inner);
+            return;
+        }
+        if (rich.classList.contains('is-collapsed')) return;
         // React 替换正文后同步替换按钮，避免闭包仍操作已经移除的旧正文。
         if (button && prepareAnswerFold.buttons.get(button) !== inner) {
             button.remove();
             button = null;
         }
-        // 使用正文实际高度判断，图片加载后再检查；不重复创建展开按钮。
-        if (!button && inner.scrollHeight > 720) {
+        // CSS 在首帧就限制预览高度；JS 只判断溢出并补充控制按钮，不再先铺全文再裁短。
+        const previewHeight = parseFloat(getComputedStyle(inner).getPropertyValue('--zb-preview-height')) || 560;
+        if (!button && inner.scrollHeight > previewHeight + 1) {
             if (!inner.id) {
                 prepareAnswerFold.nextId = (prepareAnswerFold.nextId || 0) + 1;
                 inner.id = `zb-answer-body-${prepareAnswerFold.nextId}`;
             }
-            inner.setAttribute('data-zb-folded', '');
+            const expanded = inner.hasAttribute('data-zb-expanded');
+            inner.toggleAttribute('data-zb-folded', !expanded);
             button = document.createElement('button');
             button.type = 'button';
             button.className = 'zb-answer-toggle';
-            button.textContent = '展开完整回答';
+            button.textContent = expanded ? '收起回答' : '展开完整回答';
             button.setAttribute('aria-controls', inner.id);
-            button.setAttribute('aria-expanded', 'false');
+            button.setAttribute('aria-expanded', String(expanded));
             prepareAnswerFold.buttons.set(button, inner);
             const actions = rich.querySelector(':scope > .ContentItem-actions');
             rich.insertBefore(button, actions);
             button.addEventListener('click', () => {
                 const wasExpanded = button.getAttribute('aria-expanded') === 'true';
+                inner.toggleAttribute('data-zb-expanded', !wasExpanded);
                 inner.toggleAttribute('data-zb-folded', wasExpanded);
                 button.setAttribute('aria-expanded', String(!wasExpanded));
                 button.textContent = wasExpanded ? '展开完整回答' : '收起回答';
@@ -892,7 +1013,14 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
             prepareAnswerFold.observer.observe(inner);
             prepareAnswerFold.observed.add(inner);
         }
-        if (button) syncAnswerFoldAccess(inner);
+        if (button) {
+            const expanded = inner.hasAttribute('data-zb-expanded');
+            inner.toggleAttribute('data-zb-folded', !expanded);
+            button.setAttribute('aria-expanded', String(expanded));
+            const text = expanded ? '收起回答' : '展开完整回答';
+            if (button.textContent !== text) button.textContent = text;
+            syncAnswerFoldAccess(inner);
+        }
     }
 
     // 仅让裁切线下的节点退出辅助阅读和 Tab 顺序，保留可见摘要中的链接。
@@ -1051,7 +1179,6 @@ html[data-zb-wide-layout][data-zb-lean] [data-zb-shell] {padding-inline: 20px; b
 html[data-zb-wide-layout][data-zb-lean] [data-zb-spacer] {display: none !important;}
 html[data-zb-hide-left] [data-zb-leftnav] {display: none !important;}
 html[data-zb-hide-articles] .TopstoryItem[data-zb-article] {display: none !important;}
-html[data-zb-hide-salt] [data-zb-salt-answer] {display: none !important;}
 html[data-zb-topic][data-zb-wide-layout] [data-zb-topic-sidebar] {display: none !important;}
 html[data-zb-topic][data-zb-wide-layout][data-zb-lean] main > [data-za-detail-view-path-module=TopicItem] {width: 100% !important; max-width: var(--zb-width); margin-inline: auto; padding-inline: 20px; box-sizing: border-box;}
 html[data-zb-topic][data-zb-wide-layout][data-zb-lean] [data-za-detail-view-path-module=TopicItem] > div,
@@ -1117,9 +1244,13 @@ html[data-zb-question] [data-zb-question-secondary] button[aria-label="更多"] 
 html[data-zb-question] [data-zb-question-stat] {order: 1; display: inline-flex; align-items: center; gap: 5px; color: #526476; font-size: 13px; font-variant-numeric: tabular-nums;}
 html[data-zb-question][data-theme=dark] :is([data-zb-question-stat],.QuestionButtonGroup-invite) {color: #9baabd !important;}
 html[data-zb-question] [data-zb-question-heading] button:focus-visible {outline: 2px solid #5898ff; outline-offset: 3px;}
-html[data-zb-question] .RichContent-inner[data-zb-folded] {position: relative; max-height: 560px !important; overflow: hidden !important;}
-html[data-zb-question] .RichContent-inner[data-zb-folded]::after {content: ''; position: absolute; inset: auto 0 0; height: 80px; pointer-events: none; background: linear-gradient(transparent, #fff);}
-html[data-zb-question][data-theme=dark] .RichContent-inner[data-zb-folded]::after {background: linear-gradient(transparent, #2d333b);}
+/* 限高与正文同时生效，避免长篇回答先撑高页面、随后又被 JS 缩短。 */
+html[data-zb-auto-fold] {--zb-preview-height: 560px;}
+html[data-zb-auto-fold] .Question-mainColumn .AnswerItem .RichContent:not(.is-collapsed):not([contenteditable=true]) .RichContent-inner:not([data-zb-expanded]):not([contenteditable=true]) {max-height: var(--zb-preview-height) !important; overflow: hidden !important;}
+html[data-zb-auto-fold] .RichContent-inner[data-zb-folded] {position: relative;}
+html[data-zb-auto-fold] .RichContent-inner[data-zb-folded]::after {content: ''; position: absolute; inset: auto 0 0; height: 80px; pointer-events: none; background: linear-gradient(transparent, #fff);}
+html[data-zb-auto-fold][data-theme=dark] .RichContent-inner[data-zb-folded]::after {background: linear-gradient(transparent, #2d333b);}
+.RichContent.is-collapsed > .zb-answer-toggle {display: none !important;}
 .zb-answer-toggle {display: block; width: 100%; margin: 12px 0 18px; padding: 12px; border: 1px solid rgba(133,144,166,.22); border-radius: 10px; background: transparent; color: #1769c2; font-size: 15px; cursor: pointer;}
 html[data-theme=dark] .zb-answer-toggle {color: #79b8ff; border-color: #46505e;}
 .zb-answer-toggle:hover {background: rgba(88,152,255,.08);}
@@ -1195,12 +1326,17 @@ html[data-zb-header-hidden] [data-zb-header-host]:not(:focus-within):not(:hover)
     html[data-zb-question] [data-zb-question-operations] .QuestionButtonGroup > button {min-height: 40px; padding-inline: 12px;}
     html[data-zb-question] [data-zb-question-secondary] {gap: 2px 12px;}
     .Comments-container [data-zb-comment-group] > div:not(:first-child) {margin-left: 0 !important;}
-    html[data-zb-question] .RichContent-inner[data-zb-folded] {max-height: 420px !important;}
+    html[data-zb-auto-fold] {--zb-preview-height: 420px;}
     html[data-zb-question] [data-zb-answer-card] .AnswerItem {padding: 18px !important;}
     html[data-zb-home-wide][data-zb-lean] .Topstory-mainColumn {padding-inline: 8px !important;}
     html[data-zb-lean] .LeanAppHeaderBar > div {padding-inline: 12px !important;}
 }
 @media (prefers-reduced-motion: reduce) {[data-zb-header-host] {transition: none !important;}}
+/* 静态标签提示内容类型，不隐藏回答或干预原生加载节点。 */
+.AnswerItem .zb-paid-badge {display: inline-flex !important; align-items: center; flex-shrink: 0; margin-inline-start: 8px; padding: 1px 7px; border: 1px solid #e09a21; border-radius: 5px; background: #fff0cf !important; color: #9a4a00 !important; font-size: 12px !important; font-weight: 750 !important; line-height: 20px !important; white-space: nowrap; vertical-align: middle;}
+.AnswerItem .zb-paid-badge[data-type="paid"] {background: #ffe4e4 !important; color: #b42332 !important; border-color: #ed9098;}
+html[data-theme=dark] .AnswerItem .zb-paid-badge {background: #513716 !important; color: #ffd18b !important; border-color: #ae791e;}
+html[data-theme=dark] .AnswerItem .zb-paid-badge[data-type="paid"] {background: #532730 !important; color: #ffb6bd !important; border-color: #b65868;}
 `;
     }
 
