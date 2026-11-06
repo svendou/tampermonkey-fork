@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         知乎美化 · 2026 首页适配
-// @version      0.1.12
+// @version      0.1.13
 // @author       sven
 // @description  新版首页与搜索页宽屏、圆角卡片、隐藏搜索AI总结、4种暗色方案、评论配色、广告过滤、屏蔽首页文章、醒目标记盐选和付费回答、稳定的长回答预览及开关、回答列表下拉加载修复、左侧导航开关、隐藏看山狗、图片高度限制和滚动隐藏顶栏
 // @match        *://www.zhihu.com/*
@@ -54,9 +54,12 @@
     const layoutObserver = new MutationObserver(records => {
         let answerListChanged = false;
         const foldRoots = new Set();
+        // 同一批变更中的浮条只检查一次，在绘制前处理，不等待 120ms 美化队列。
+        hideSelectionToolbar(records.map(record => record.target.nodeType === 1 ? record.target : record.target.parentElement).filter(Boolean));
         for (const record of records) {
             const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
             if (!target || target.closest('style,script,.zb-answer-toggle,.zb-paid-badge')) continue;
+            if (target.closest('[data-zb-selection-toolbar]')) continue;
             if (record.type === 'attributes') {
                 // 只关心正文内影响布局或键盘访问的属性，不处理全页动画和计数变化。
                 const inner = target.closest('.RichContent-inner');
@@ -119,7 +122,7 @@
             !event.target.closest?.('input,textarea,select,[contenteditable=true]')) resumeAnswerLoading();
     });
     document.addEventListener('visibilitychange', scheduleAnswerLoadCheck);
-    // 划词工具条由初始扫描、新增子树及文本变化识别，拖选时无需每帧查询整页。
+    // 划词工具条由初始扫描和局部 DOM 变更识别，拖选时无需每帧查询整页。
     // 用户主动点击知乎的阅读全文后保持展开，避免立即被摘要预览重新收起。
     document.addEventListener('click', event => {
         const more = event.target.closest?.('.ContentItem-more');
@@ -879,15 +882,35 @@ html {filter: brightness(65%) sepia(30%) !important; background-image: url();}
     }
 
     function hideSelectionToolbar(scope = document) {
-        // 只识别带复制、喜欢、评论和 AI 解释的划词工具条，不拦截文字选择。
-        forEachWithin(scope, 'svg.ZDI--Repeat24', icon => {
-            let target = null;
-            for (let el = icon.parentElement, depth = 0; el && depth < 6; el = el.parentElement, depth++) {
-                const text = el.textContent.replace(/\s/g, '');
-                if (text.length > 80) break;
-                if (text.includes('复制') && text.includes('喜欢') && text.includes('评论') && text.includes('AI解释')) target = el;
+        const portals = new Set();
+        for (const root of Array.isArray(scope) ? scope : [scope]) {
+            if (root === document || root === document.body) {
+                // 知乎将浮条挂在 body 下，初始扫描也不进入回答列表。
+                for (const child of document.body?.children || []) {
+                    if (child.tagName === 'DIV' && child.id !== 'root') portals.add(child);
+                }
+                continue;
             }
-            if (target && !target.hasAttribute('data-zb-selection-toolbar')) target.setAttribute('data-zb-selection-toolbar', '');
+            // 文本、计数和按钮可以分批填充；从变更节点找回共同的浮条容器。
+            for (let el = root, depth = 0; el && depth < 8; el = el.parentElement, depth++) {
+                if (el.id === 'root' || el.matches('main,article,.AnswerItem,.RichText,.CommentContent')) break;
+                if (el.parentElement === document.body) {
+                    if (el.tagName === 'DIV') portals.add(el);
+                    break;
+                }
+            }
+        }
+        portals.forEach(portal => {
+            const marked = portal.hasAttribute('data-zb-selection-toolbar');
+            const text = portal.textContent.replace(/\s/g, '');
+            // 喜欢和评论可能显示为数字；用三个图标与复制、AI 解释共同确认。
+            let toolbar = text.length <= 80 && text.includes('复制') && text.includes('AI解释') &&
+                !!portal.querySelector('svg.ZDI--Repeat24') && !!portal.querySelector('svg.ZDI--Heart24') &&
+                !!portal.querySelector('svg.ZDI--ChatBubble24') && !portal.isContentEditable &&
+                !portal.querySelector('input,textarea,[contenteditable]:not([contenteditable="false"])');
+            if (toolbar) toolbar = ['absolute', 'fixed'].includes(getComputedStyle(portal).position);
+            // 容器改作其它弹层时移除标记，保留正常菜单和编辑器。
+            if (marked !== toolbar) portal.toggleAttribute('data-zb-selection-toolbar', toolbar);
         });
     }
 
@@ -1269,8 +1292,8 @@ html[data-zb-lean] .TopstoryItem .ContentItem-title {margin: 0 0 10px !important
 html[data-zb-lean] .TopstoryItem .RichContent-inner {line-height: 1.8;}
 /* 只隐藏看山狗入口，保留正常的回到顶部等工具。 */
 .KanshanCornerButton, .CornerAnimayedFlex--kanshanEntry {display: none !important;}
-/* 划词浮条的当前结构直接屏蔽；语义识别兼容构建类名变化。 */
-[data-zb-selection-toolbar], .css-1qgg1gw:has(.ZDI--Repeat24):has(.ZDI--Heart24):has(.ZDI--ChatBubble24) {display: none !important;}
+/* 仅隐藏已确认的划词浮条，不依赖构建类名，也不改变正文选区。 */
+[data-zb-selection-toolbar] {display: none !important;}
 /* 回答间文字链广告、侧栏广告和信息流广告。 */
 .pc-article-answer-text-chain, .pc-article-answer-big-img, .Pc-card.Card, .TopstoryItem--advertCard,
 .Pc-Business-Card-PcTopFeedBanner, .Topstory-advertCard, .Pc-feedAd-container {display: none !important;}
